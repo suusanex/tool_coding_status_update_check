@@ -426,3 +426,8 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# File-based apps generate a project file beside the entry script.
+*.cs.csproj
+.review/
+.codex-agent-facade/

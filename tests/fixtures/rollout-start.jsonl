@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-01T00:10:00.000Z","type":"session_meta","payload":{"session_id":"sess-start","cwd":"D:\\work\\widgets","git":{"repository_url":"https://github.com/acme/widgets","branch":"main"}}}
+{"timestamp":"2026-11-01T00:11:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":"実装を開始した。"}}
