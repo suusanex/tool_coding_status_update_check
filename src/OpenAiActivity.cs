@@ -2,6 +2,7 @@
 #pragma warning disable OPENAI001
 
 using System.ClientModel;
+using System.Globalization;
 using System.Text.Json.Nodes;
 using OpenAI.Responses;
 
@@ -41,11 +42,10 @@ internal sealed class OpenAiActivityModel : IActivityModel
     public Task<IReadOnlyList<ExtractedActivity>> ExtractAsync(ActivityPacket packet, CancellationToken cancellationToken) =>
         CallAsync("extract", ExtractionSystem, PacketText(packet), "activity_extraction", ExtractionSchema, ParseExtraction, cancellationToken);
 
-    public async Task<WorkstreamChoice> ChooseWorkstreamAsync(WorkstreamChoiceRequest request, CancellationToken cancellationToken)
+    public Task<WorkstreamChoice> ChooseWorkstreamAsync(WorkstreamChoiceRequest request, CancellationToken cancellationToken)
     {
         var user = "repository: " + request.Repository + "\nsummary: " + request.Summary + "\nheadings:\n- " + string.Join("\n- ", request.Headings);
-        var results = await CallAsync("workstream", WorkstreamSystem, user, "workstream_choice", WorkstreamSchema, ParseChoice, cancellationToken);
-        return results;
+        return CallAsync("workstream", WorkstreamSystem, user, "workstream_choice", WorkstreamSchema, ParseChoice, cancellationToken);
     }
 
     public Task<IReadOnlyList<ConcentrationItem>> ConcentrateAsync(IReadOnlyList<ActivityView> activities, CancellationToken cancellationToken)
@@ -75,7 +75,7 @@ internal sealed class OpenAiActivityModel : IActivityModel
 
         try
         {
-            ClientResult<ResponseResult> result = await SendAsync(system, user, schemaName, schema, cancellationToken);
+            ClientResult<ResponseResult> result = await SendAsync(stage, system, user, schemaName, schema, cancellationToken);
             var text = result.Value.GetOutputText();
             var usage = result.Value.Usage;
             var input = usage?.InputTokenCount ?? projectedInput;
@@ -109,9 +109,9 @@ internal sealed class OpenAiActivityModel : IActivityModel
         }
     }
 
-    private async Task<ClientResult<ResponseResult>> SendAsync(string system, string user, string schemaName, string schema, CancellationToken cancellationToken)
+    private async Task<ClientResult<ResponseResult>> SendAsync(string stage, string system, string user, string schemaName, string schema, CancellationToken cancellationToken)
     {
-        Exception? last = null;
+        ClientResultException? last = null;
         for (var attempt = 1; attempt <= _maxRetries; attempt++)
         {
             try
@@ -144,11 +144,75 @@ internal sealed class OpenAiActivityModel : IActivityModel
             }
             catch (ClientResultException ex)
             {
-                throw new StatusCheckException("The OpenAI request failed.", ex);
+                throw new StatusCheckException(FormatFailure(stage, _model, attempt, exhausted: false, ex.Status, ResponseDetail(ex)), ex);
             }
         }
 
-        throw new StatusCheckException("The OpenAI request failed after retries.", last!);
+        // 呼び出し側は Exception.Message だけを出す。status と応答本文をここに残さないと原因が消える。
+        throw new StatusCheckException(FormatFailure(stage, _model, _maxRetries, exhausted: true, last!.Status, ResponseDetail(last)), last);
+    }
+
+    /// <summary>
+    /// 表示用の1行。応答本文は秘密らしい部分を伏せ、長さを切る。
+    /// </summary>
+    internal static string FormatFailure(string stage, string model, int attempts, bool exhausted, int status, string? detail)
+    {
+        var head = exhausted
+            ? "The OpenAI request failed after " + attempts.ToString(CultureInfo.InvariantCulture) + " attempts."
+            : "The OpenAI request failed.";
+        return head
+            + " stage=" + stage
+            + " model=" + model
+            + " status=" + status.ToString(CultureInfo.InvariantCulture)
+            + " detail=" + OneLine(detail);
+    }
+
+    private static string ResponseDetail(ClientResultException exception)
+    {
+        try
+        {
+            var content = exception.GetRawResponse()?.Content?.ToString();
+            if (!string.IsNullOrWhiteSpace(content))
+            {
+                return content;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // バッファされていない応答は本文を読めない。例外メッセージへ落とす。
+        }
+
+        return exception.Message;
+    }
+
+    private static string OneLine(string? text)
+    {
+        var redacted = Redaction.Apply(text);
+        var builder = new System.Text.StringBuilder();
+        var pendingSpace = false;
+        foreach (var ch in redacted)
+        {
+            if (char.IsWhiteSpace(ch))
+            {
+                pendingSpace = builder.Length > 0;
+                continue;
+            }
+
+            if (pendingSpace)
+            {
+                builder.Append(' ');
+                pendingSpace = false;
+            }
+
+            builder.Append(ch);
+            if (builder.Length >= 300)
+            {
+                builder.Append("...");
+                break;
+            }
+        }
+
+        return builder.Length == 0 ? "(none)" : builder.ToString();
     }
 
     private static string PacketText(ActivityPacket packet)

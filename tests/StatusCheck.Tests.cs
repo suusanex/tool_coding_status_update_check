@@ -1,5 +1,6 @@
 #:property TargetFramework=net10.0
 #:package Microsoft.Data.Sqlite@9.0.10
+#:package OpenAI@2.14.0
 #:include ../src/Config.cs
 #:include ../src/TimeWindow.cs
 #:include ../src/Models.cs
@@ -12,6 +13,7 @@
 #:include ../src/GitHubClient.cs
 #:include ../src/ActivityGrouping.cs
 #:include ../src/Ledger.cs
+#:include ../src/OpenAiActivity.cs
 #:include ../src/Report.cs
 #:include ../src/Pipeline.cs
 
@@ -41,6 +43,7 @@ await Case("rerun does not add another commit", Rerun);
 await Case("an incomplete line is resumed once", IncompleteLine);
 await Case("invalid json does not stop the run", InvalidJsonContinues);
 await Case("invalid utf-8 chunk is skipped", InvalidUtf8Chunk);
+await Case("openai failure keeps status and detail", OpenAiFailureMessage);
 await Case("closed unmerged is not merged", ClosedUnmerged);
 await Case("self invocation is excluded and tool development is kept", SelfAndDevelopment);
 
@@ -455,6 +458,26 @@ async Task InvalidUtf8Chunk()
     Check(second.ExitCode == 0, "second utf-8 run stopped: " + second.StopReason);
     Check(second.SkippedLogs.Count == 0, "utf-8 chunk was reported again");
     Check(world.Store.ListByNative("codex", "sess-later").Count(item => item.Draft.Kind == "user_message") == 1, "second run duplicated the later file");
+}
+
+Task OpenAiFailureMessage()
+{
+    var text = OpenAiActivityModel.FormatFailure("extract", "gpt-6.1-terra", 3, true, 429, "{\n  \"error\": { \"message\": \"Rate limit exceeded\" }\n}");
+    Check(text.Contains("after 3 attempts.", StringComparison.Ordinal), text);
+    Check(text.Contains("stage=extract", StringComparison.Ordinal), text);
+    Check(text.Contains("model=gpt-6.1-terra", StringComparison.Ordinal), text);
+    Check(text.Contains("status=429", StringComparison.Ordinal), text);
+    Check(text.Contains("Rate limit exceeded", StringComparison.Ordinal), text);
+    Check(!text.Contains('\n'), "detail kept a newline");
+    var secret = OpenAiActivityModel.FormatFailure("extract", "m", 1, false, 400, "bad sk-" + new string('a', 20));
+    Check(secret.Contains("[REDACTED]", StringComparison.Ordinal), secret);
+    Check(!secret.Contains(new string('a', 20), StringComparison.Ordinal), "secret leaked");
+    var empty = OpenAiActivityModel.FormatFailure("concentrate", "m", 1, false, 500, "  \n");
+    Check(empty.Contains("detail=(none)", StringComparison.Ordinal), empty);
+    var truncated = OpenAiActivityModel.FormatFailure("extract", "m", 1, true, 503, new string('x', 400));
+    Check(truncated.Contains("xxx...", StringComparison.Ordinal), truncated);
+    Check(!truncated.Contains(new string('x', 301), StringComparison.Ordinal), "detail was not capped");
+    return Task.CompletedTask;
 }
 
 async Task ClosedUnmerged()
