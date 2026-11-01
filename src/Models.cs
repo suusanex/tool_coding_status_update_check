@@ -159,7 +159,18 @@ internal sealed class ThreadAssessment
     }
 }
 
-internal sealed record LedgerFieldUpdate(string Workstream, string Action, string Current, string Next, string Waiting, string Reason);
+/// <summary>
+/// 台帳の一つの workstream への判断。current、next、waiting は完成後の値。
+/// null は変更しない。空文字はその欄を空にする。reportIds は判断に使った報告だけ。
+/// </summary>
+internal sealed record LedgerFieldUpdate(
+    string Workstream,
+    string Action,
+    string? Current,
+    string? Next,
+    string? Waiting,
+    string Reason,
+    IReadOnlyList<string>? ReportIds = null);
 
 internal interface IActivityModel
 {

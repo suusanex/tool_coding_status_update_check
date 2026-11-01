@@ -41,6 +41,9 @@ await Case("an old file mtime does not drop in-window events", OldMtimeInWindow)
 await Case("an old observation body is not sent", OldObservation);
 await Case("estimate counts the selected payload and does not call the model", EstimateOnly);
 await Case("an open pull on another report blocks deletion", OpenPullBlocksDelete);
+await Case("saved matching does not delete a coordinator update", CoordinatorUpdateSurvivesMerge);
+await Case("another workstream report does not mix into completion", OtherWorkstreamStaysOut);
+await Case("an empty field clears and null keeps the ledger", EmptyClearsNullKeeps);
 await Case("a replaced rollout does not keep the old thread", ReplacedRolloutDropsOldThread);
 await Case("an outside merge stays with an active card", OutsideMergeJoinsActiveCard);
 await Case("an unselected pull does not hold the card", UnselectedPullDoesNotHold);
@@ -558,9 +561,8 @@ Task OpenPullBlocksDelete()
     var merged = Snapshot(8, PullRequestState.Merged);
     var older = ReportView("old", "先に出した。 https://github.com/acme/widgets/pull/7", "2026-11-01T00:20:00Z", open);
     var newer = ReportView("new", "実装を完了した。 https://github.com/acme/widgets/pull/8", "2026-11-01T00:40:00Z", merged);
-    var blocked = LedgerPlanner.Apply(card, [older, newer], [new LedgerFieldUpdate("ウィジェット修正", "delete", "", "", "", "")]);
-    Check(blocked is not null && blocked.NewText.Contains("### ウィジェット修正", StringComparison.Ordinal), "open pull was deleted");
-    Check(blocked!.NewText.Contains("pull/8", StringComparison.Ordinal), "new pull was dropped");
+    var blocked = LedgerPlanner.Apply(card, [older, newer], [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:old", "codex:new"])]);
+    Check(blocked is null, "open pull was deleted");
 
     var both = LedgerPlanner.Apply(
         card,
@@ -568,7 +570,7 @@ Task OpenPullBlocksDelete()
             ReportView("old", "先に出した。 https://github.com/acme/widgets/pull/7", "2026-11-01T00:20:00Z", Snapshot(7, PullRequestState.Merged)),
             newer,
         ],
-        [new LedgerFieldUpdate("ウィジェット修正", "delete", "", "", "", "")]);
+        [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:old", "codex:new"])]);
     Check(both is not null && !both.NewText.Contains("### ウィジェット修正", StringComparison.Ordinal), "merged pulls kept the workstream");
     Check(both!.NewText.Contains("### 文書整理", StringComparison.Ordinal), "other workstream was removed with the merged pulls");
     return Task.CompletedTask;
@@ -675,6 +677,74 @@ async Task UnselectedPullDoesNotHold()
     var report = File.ReadAllText(result.ReportPath);
     Check(!report.Contains("複数のProjectカード", StringComparison.Ordinal), "unselected pull forced a hold");
     Check(world.Model.Payloads.Any(payload => payload.Contains("projects/widgets.md", StringComparison.Ordinal)), "selected pull did not reach reconcile");
+}
+
+async Task CoordinatorUpdateSurvivesMerge()
+{
+    await using var world = World.Create();
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
+    await world.Run(true);
+    var path = Path.Combine(world.Ledger, "projects", "widgets.md");
+    var rewritten = world.CardText().Replace("実装を完了した。 https://github.com/acme/widgets/pull/7", "実装済み。次は導入作業。", StringComparison.Ordinal);
+    File.WriteAllText(path, rewritten, World.FileEncoding);
+    LedgerGit.Run(world.Ledger, ["add", "--", "projects/widgets.md"]);
+    LedgerGit.Run(world.Ledger, ["commit", "-m", "coordinator"]);
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 2, 0, 0, TimeSpan.Zero));
+    await world.Run(true);
+    var text = world.CardText();
+    Check(text.Contains("### ウィジェット修正", StringComparison.Ordinal), "saved matching deleted the coordinator update");
+    Check(text.Contains("導入作業", StringComparison.Ordinal), "coordinator text was removed");
+    Check(world.Model.Payloads.Any(payload => payload.Contains("導入作業", StringComparison.Ordinal)), "merge skipped reconciliation with the current ledger");
+}
+
+Task OtherWorkstreamStaysOut()
+{
+    var card = CardParser.Parse("projects/widgets.md", TwoCard(null));
+    var feature = ReportView("feature", "実装を完了した。 https://github.com/acme/widgets/pull/7", "2026-11-01T00:20:00Z", Snapshot(7, PullRequestState.Merged));
+    var docs = ReportView("docs", "残作業は説明書の更新。", "2026-11-01T00:40:00Z", Snapshot(8, PullRequestState.Open));
+    docs = new ThreadView
+    {
+        Thread = docs.Thread,
+        Assessment = new ThreadAssessment
+        {
+            Summary = "残作業は説明書の更新。",
+            Purpose = "",
+            CurrentPosition = "残作業は説明書の更新。",
+            ExplicitRemainingWork = "残作業は説明書の更新。",
+            NextAction = "",
+            Uncertainty = "",
+            SelectedPullUrls = [],
+        },
+        Pulls = [],
+    };
+    var deleted = LedgerPlanner.Apply(card, [feature, docs], [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:feature"])]);
+    Check(deleted is not null && !deleted.NewText.Contains("### ウィジェット修正", StringComparison.Ordinal), "named merged report did not complete its workstream");
+    Check(!deleted!.NewText.Contains("残作業は説明書の更新", StringComparison.Ordinal), "another workstream remaining work was mixed in");
+    Check(deleted.NewText.Contains("### 文書整理", StringComparison.Ordinal), "the other workstream was removed");
+    return Task.CompletedTask;
+}
+
+Task EmptyClearsNullKeeps()
+{
+    var card = CardParser.Parse("projects/widgets.md", OneCard("https://github.com/acme/widgets/pull/7").Replace("なし。", "認証エラーで停止。", StringComparison.Ordinal));
+    var view = ReportView("sess", "認証エラーを解消し、実装を再開した。", "2026-11-01T00:20:00Z", Snapshot(7, PullRequestState.Open));
+    var cleared = LedgerPlanner.Apply(card, [view], [new LedgerFieldUpdate("ウィジェット修正", "update", "認証エラーを解消し、実装を再開した。", null, "", "", ["codex:sess"])]);
+    Check(cleared is not null && !cleared.NewText.Contains("認証エラーで停止", StringComparison.Ordinal), "empty waiting kept the old blocker");
+    Check(cleared!.NewText.Contains("認証エラーを解消し、実装を再開した。", StringComparison.Ordinal), "new current was dropped");
+    Check(cleared.NewText.Contains("実装を続ける。", StringComparison.Ordinal), "null next cleared the ledger");
+    var kept = LedgerPlanner.Apply(card, [view], [new LedgerFieldUpdate("ウィジェット修正", "update", "認証エラーを解消し、実装を再開した。", null, null, "", ["codex:sess"])]);
+    Check(kept is not null && kept.NewText.Contains("認証エラーで停止", StringComparison.Ordinal), "null waiting cleared the ledger");
+    var parsed = ThreadPrompts.ParseReconcile("""
+        {"updates":[{"workstream":"機能追加","action":"update","current":"再開した。","next":null,"waiting":"","reason":"","reportIds":["codex:a"]}]}
+        """);
+    Check(parsed.Count == 1 && parsed[0].Next is null && parsed[0].Waiting == "" && parsed[0].ReportIds!.Contains("codex:a"), "reconcile JSON lost null, empty, or report ids");
+    return Task.CompletedTask;
 }
 
 static ThreadView ReportView(string id, string response, string at, PullRequestSnapshot pull)
@@ -1098,18 +1168,40 @@ internal sealed class ScriptedModel : IActivityModel
     public Task<IReadOnlyList<LedgerFieldUpdate>> ReconcileAsync(string system, string user, CancellationToken cancellationToken)
     {
         Payloads.Add(system + "\n" + user);
-        if (!user.Contains("### ウィジェット修正", StringComparison.Ordinal))
+        if (!user.Contains("### ウィジェット修正", StringComparison.Ordinal) || user.Contains("導入作業", StringComparison.Ordinal))
         {
             return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([]);
         }
 
         var response = Section(user, "response");
+        var ids = ReportIds(user);
         if (response.Contains("残作業", StringComparison.Ordinal) || !AllMerged(user) || (!response.Contains("実装完了", StringComparison.Ordinal) && !response.Contains("完了した", StringComparison.Ordinal)))
         {
-            return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([new LedgerFieldUpdate("ウィジェット修正", "update", response, "", "", "")]);
+            return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([new LedgerFieldUpdate("ウィジェット修正", "update", response, null, null, "", ids)]);
         }
 
-        return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([new LedgerFieldUpdate("ウィジェット修正", "delete", "", "", "", "")]);
+        return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ids)]);
+    }
+
+    private static List<string> ReportIds(string user)
+    {
+        var normalized = user.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        var ids = new List<string>();
+        foreach (var line in normalized.Split('\n'))
+        {
+            if (!line.StartsWith("id: ", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var id = line[4..].Trim();
+            if (id.Length > 0 && !ids.Contains(id, StringComparer.Ordinal))
+            {
+                ids.Add(id);
+            }
+        }
+
+        return ids;
     }
 
     private static string Section(string user, string label)

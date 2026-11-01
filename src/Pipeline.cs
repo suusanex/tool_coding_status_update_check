@@ -406,17 +406,6 @@ internal static class StatusPipeline
                 continue;
             }
 
-            if (TryFastComplete(group.Card, views, out var fast))
-            {
-                if (fast is not null)
-                {
-                    changes.Add(fast);
-                }
-
-                Remember(request.Store, group.Card, views, fast);
-                continue;
-            }
-
             var hash = ReconcileHash(group.Card.Text, views);
             if (views.All(view => view.Thread.ReconcileFingerprint == hash))
             {
@@ -471,25 +460,6 @@ internal static class StatusPipeline
         var saved = Copy(thread, confirmed);
         request.Store.UpsertThread(saved);
         return saved;
-    }
-
-    private static bool TryFastComplete(ProjectCard card, IReadOnlyList<ThreadView> views, out LedgerChange? change)
-    {
-        change = null;
-        if (views.Count != 1 || !LedgerPlanner.CanDelete(views))
-        {
-            return false;
-        }
-
-        var view = views[0];
-        var heading = view.Thread.MatchedWorkstream;
-        if (string.IsNullOrWhiteSpace(heading) || card.Workstreams.All(workstream => workstream.Heading != heading))
-        {
-            return false;
-        }
-
-        change = LedgerPlanner.Apply(card, views, [new LedgerFieldUpdate(heading, "delete", "", "", "", "")]);
-        return true;
     }
 
     private static void Remember(StateStore store, ProjectCard card, IReadOnlyList<ThreadView> views, LedgerChange? change)

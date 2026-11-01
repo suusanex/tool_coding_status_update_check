@@ -337,27 +337,27 @@ internal static class LedgerPlanner
             }
 
             var action = update.Action.ToLowerInvariant();
-            var relevant = Relevant(card, slice, reports);
-            if (action == "delete" && !CanDelete(relevant))
-            {
-                action = "update";
-            }
-
+            var relevant = ReportsFor(reports, update);
             if (action == "delete")
             {
+                if (!CanDelete(relevant))
+                {
+                    continue;
+                }
+
                 edits[slice.Heading] = (slice.Start, slice.Length, "");
                 current = CardParser.RewriteCurrent(current ?? card.Current, slice.Current, CompletionFact, newline);
             }
             else
             {
                 var latest = Latest(relevant);
-                var renderedCurrent = FirstText(update.Current, latest?.Assessment?.CurrentPosition, slice.Current);
-                var renderedNext = FirstText(update.Next, latest?.Assessment?.NextAction, slice.Next);
-                var renderedWaiting = FirstText(update.Waiting, latest?.Assessment?.ExplicitRemainingWork, slice.Waiting);
+                var renderedCurrent = ResolveField(update.Current, slice.Current);
+                var renderedNext = ResolveField(update.Next, slice.Next);
+                var renderedWaiting = ResolveField(update.Waiting, slice.Waiting);
                 if (string.IsNullOrWhiteSpace(latest?.Assessment?.ExplicitRemainingWork) &&
-                    slice.Current.Contains(renderedCurrent, StringComparison.Ordinal) &&
-                    (string.IsNullOrWhiteSpace(update.Next) || slice.Next.Contains(renderedNext, StringComparison.Ordinal)) &&
-                    (string.IsNullOrWhiteSpace(update.Waiting) || slice.Waiting.Contains(renderedWaiting, StringComparison.Ordinal) || slice.Current.Contains(renderedWaiting, StringComparison.Ordinal)))
+                    FieldKept(update.Current, renderedCurrent, slice.Current) &&
+                    FieldKept(update.Next, renderedNext, slice.Next) &&
+                    FieldKept(update.Waiting, renderedWaiting, slice.Waiting))
                 {
                     var urls = relevant.SelectMany(report => report.Pulls.Select(pull => pull.Url));
                     if (urls.All(url => slice.References.Contains(url, StringComparison.Ordinal)))
@@ -369,7 +369,7 @@ internal static class LedgerPlanner
                 if (!string.IsNullOrWhiteSpace(latest?.Assessment?.ExplicitRemainingWork))
                 {
                     renderedWaiting = latest!.Assessment!.ExplicitRemainingWork;
-                    if (string.IsNullOrWhiteSpace(update.Next))
+                    if (update.Next is null || string.IsNullOrWhiteSpace(update.Next))
                     {
                         renderedNext = "管理側へこの残作業を戻す。";
                     }
@@ -460,25 +460,19 @@ internal static class LedgerPlanner
         return pulls.Count > 0 && pulls.All(pull => pull.State == PullRequestState.Merged);
     }
 
-    private static bool Links(ThreadView report, WorkstreamSlice slice) =>
-        report.Pulls.Any(pull => slice.Raw.Contains(pull.Url, StringComparison.OrdinalIgnoreCase));
-
     /// <summary>
-    /// カードに既にある URL の報告だけに絞ると、同じ workstream の新しい PR が脱落する。
-    /// 他の workstream に紐づかない報告は残す。
+    /// 更新案が名指しした報告だけを完了判定と欄の上書きに使う。他の報告は足さない。
     /// </summary>
-    private static IReadOnlyList<ThreadView> Relevant(ProjectCard card, WorkstreamSlice slice, IReadOnlyList<ThreadView> reports)
+    private static IReadOnlyList<ThreadView> ReportsFor(IReadOnlyList<ThreadView> reports, LedgerFieldUpdate update)
     {
-        var linked = reports.Where(report => Links(report, slice)).ToList();
-        if (linked.Count == 0)
+        var ids = update.ReportIds;
+        if (ids is null || ids.Count == 0)
         {
-            return reports;
+            return [];
         }
 
-        var extras = reports.Where(report =>
-            !linked.Contains(report) &&
-            card.Workstreams.All(other => other.Heading == slice.Heading || !Links(report, other)));
-        return linked.Concat(extras).ToList();
+        var wanted = ids.ToHashSet(StringComparer.Ordinal);
+        return reports.Where(report => wanted.Contains(report.Thread.Source + ":" + report.Thread.NativeId)).ToList();
     }
 
     private static ThreadView? Latest(IReadOnlyList<ThreadView> reports) =>
@@ -490,18 +484,14 @@ internal static class LedgerPlanner
         return latest is null ? "" : latest.Thread.Source + ":" + latest.Thread.NativeId;
     }
 
-    private static string FirstText(params string?[] values)
-    {
-        foreach (var value in values)
-        {
-            if (!string.IsNullOrWhiteSpace(value))
-            {
-                return value.Trim();
-            }
-        }
+    private static string ResolveField(string? proposed, string existing) =>
+        proposed is null ? existing : proposed.Trim();
 
-        return "";
-    }
+    /// <summary>
+    /// null は変更しない。空文字は「既に同じ」にはしない。
+    /// </summary>
+    private static bool FieldKept(string? proposed, string rendered, string existing) =>
+        proposed is null || (rendered.Length > 0 && existing.Contains(rendered, StringComparison.Ordinal));
 
     private static string AppendUrls(string existing, IEnumerable<string> urls, string newline)
     {

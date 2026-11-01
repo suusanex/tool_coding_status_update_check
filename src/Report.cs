@@ -78,7 +78,7 @@ internal static class ReportWriter
         builder.AppendLine("- payload 文字数: " + estimate.PayloadChars.ToString(System.Globalization.CultureInfo.InvariantCulture));
         builder.AppendLine("- 入力トークン推定: " + estimate.InputTokens.ToString(System.Globalization.CultureInfo.InvariantCulture));
         builder.AppendLine("- 入力トークン推定は文字数を4で割った値であり、出力は含まない。");
-        builder.AppendLine("- reconcile 呼び出しは上限である。未評価のスレッドは選択前の候補 URL で見積もる。pull 状態は Open の仮値であり、gh は呼ばない。実実行がマージ済みで照合を省略する場合より多くなることがある。");
+        builder.AppendLine("- reconcile 呼び出しは上限である。未評価のスレッドは選択前の候補 URL で見積もる。pull 状態は Open の仮値であり、gh は呼ばない。");
         builder.AppendLine("- 途中ログがpayloadに含まれる: " + (estimate.PayloadContainsToolUpdates ? "はい" : "いいえ"));
         builder.AppendLine();
         AppendSkips(builder, skips);
