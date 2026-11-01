@@ -21,7 +21,7 @@ dotnet run --file src/StatusCheck.cs -- apply --proposal <runId>
 
 初回実行で `%USERPROFILE%\.coding-status-check\config.json` を作る。状態DBとレポートは `%USERPROFILE%\.coding-status-check\` に置く。ここには redact 済みの本文も残る。このリポジトリには commit しない。
 
-`estimate` は API を呼ばず、同じ選択と同じプロンプトで入力トークン数の見込みだけを出す。台帳も変えない。`preview` はレポートと提案だけを残し、台帳は変えない。`run` は検査を通った Project カードだけを台帳リポジトリへ commit する。`apply` は保存済み提案を、いまのカードといまの PR 状態で再検査してから書く。PR状態が提案時と違えば何も書かない。
+`estimate` は API も gh も呼ばず、同じ選択と同じプロンプト組み立てで入力トークン数の見込みだけを出す。台帳も変えない。reconcile の回数は上限で、pull 状態は Open の仮値である。`preview` はレポートと提案だけを残し、台帳は変えない。`run` は検査を通った Project カードだけを台帳リポジトリへ commit する。`apply` は保存済み提案を、いまのカードといまの PR 状態で再検査してから書く。PR状態が提案時と違えば何も書かない。
 
 `--last-days 2` はローカル日付の昨日と今日である。`--from` と `--to` は両端を含む。期間は対象スレッドを選ぶために使う。選ばれたスレッドの最初の依頼は、期間外でも使う。レポートに書く応答日時は、採用した通常応答の時刻である。
 

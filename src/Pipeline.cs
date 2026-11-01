@@ -223,6 +223,12 @@ internal static class StatusPipeline
         {
             if (selection.Request is null && selection.Response is null && selection.FirstEvent is null)
             {
+                // 置き換わったファイルにセッションが無いとき、古いスレッドを残すと台帳へ返り続ける。
+                if (read.Reset)
+                {
+                    request.Store.DeleteOtherThreads("codex", path, null);
+                }
+
                 return;
             }
 
@@ -233,6 +239,10 @@ internal static class StatusPipeline
 
         var record = ToRecord("codex", path, selection.NativeId, selection.Repository, selection.Cwd, selection.Request, selection.Response, selection.FirstEvent, selection.LastEvent, request.Store, rebuild, seeded);
         request.Store.UpsertThread(record);
+        if (read.Reset)
+        {
+            request.Store.DeleteOtherThreads("codex", path, record.NativeId);
+        }
         cursor.NativeId = record.NativeId;
         cursor.Repository = record.Repository;
         cursor.Cwd = record.Cwd;
@@ -335,7 +345,7 @@ internal static class StatusPipeline
         var groups = new Dictionary<string, (ProjectCard Card, List<ThreadRecord> Threads)>(StringComparer.Ordinal);
         foreach (var thread in byId.Values.OrderBy(thread => thread.NativeId, StringComparer.Ordinal))
         {
-            var candidates = Candidates(thread);
+            var candidates = SelectedCandidates(thread);
             var match = MatchCard(thread, candidates, cards);
             if (match.Card is null)
             {
@@ -359,8 +369,13 @@ internal static class StatusPipeline
 
         foreach (var tracked in await RefreshOutsideWindowAsync(request, threads, eligible, cards, cancellationToken))
         {
-            if (groups.ContainsKey(tracked.Card.RelativePath))
+            if (groups.TryGetValue(tracked.Card.RelativePath, out var existing))
             {
+                if (existing.Threads.All(thread => thread.Source != tracked.Thread.Source || thread.NativeId != tracked.Thread.NativeId))
+                {
+                    existing.Threads.Add(tracked.Thread);
+                }
+
                 continue;
             }
 
@@ -374,7 +389,7 @@ internal static class StatusPipeline
 
         var snapshots = await QueryPullsAsync(
             request,
-            groups.Values.SelectMany(group => group.Threads.SelectMany(thread => Candidates(thread).Select(reference => (reference, thread.Source + ":" + thread.NativeId)))),
+            groups.Values.SelectMany(group => group.Threads.SelectMany(thread => SelectedCandidates(thread).Select(reference => (reference, thread.Source + ":" + thread.NativeId)))),
             cancellationToken);
         var changes = new List<LedgerChange>();
         foreach (var group in groups.Values)
@@ -594,7 +609,7 @@ internal static class StatusPipeline
                 prompts.Add(("assess", ThreadPrompts.AssessSystem, ThreadPrompts.AssessUser(thread, Candidates(thread))));
             }
 
-            var match = MatchCard(thread, Candidates(thread), cards);
+            var match = MatchCard(thread, SelectedCandidates(thread), cards);
             if (match.Card is null)
             {
                 continue;
@@ -615,7 +630,7 @@ internal static class StatusPipeline
             {
                 Thread = thread,
                 Assessment = thread.Assessment,
-                Pulls = Candidates(thread).Select(candidate => new PullRequestSnapshot(candidate.Url, candidate.Owner, candidate.Repository, candidate.Number, PullRequestState.Open, null, null, "")).ToList(),
+                Pulls = SelectedCandidates(thread).Select(candidate => new PullRequestSnapshot(candidate.Url, candidate.Owner, candidate.Repository, candidate.Number, PullRequestState.Open, null, null, "")).ToList(),
             }).ToList();
             var hash = ReconcileHash(group.Card.Text, views);
             if (views.All(view => view.Assessment is not null && view.Thread.ReconcileFingerprint == hash))
@@ -668,6 +683,23 @@ internal static class StatusPipeline
         }
 
         return (null, new HoldNote { ActivityId = activityId, Reason = "repositoryもURLも一致しない。" });
+    }
+
+    /// <summary>
+    /// 評価が PR を選んだ後は、その URL だけをカード照合と gh 照会に使う。
+    /// 未評価のときは本文から集めた候補を返す。
+    /// </summary>
+    private static IReadOnlyList<GitHubRef> SelectedCandidates(ThreadRecord thread)
+    {
+        var candidates = Candidates(thread);
+        var selected = thread.Assessment?.SelectedPullUrls;
+        if (selected is null || selected.Count == 0)
+        {
+            return candidates;
+        }
+
+        var chosen = candidates.Where(candidate => selected.Contains(candidate.Url, StringComparer.OrdinalIgnoreCase)).ToList();
+        return chosen.Count == 0 ? candidates : chosen;
     }
 
     private static IReadOnlyList<GitHubRef> Candidates(ThreadRecord thread)

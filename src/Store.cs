@@ -486,6 +486,25 @@ internal sealed class StateStore : IDisposable
         }
     }
 
+    public void DeleteOtherThreads(string source, string path, string? keepNativeId)
+    {
+        lock (_gate)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = keepNativeId is null
+                ? "DELETE FROM threads WHERE source = $source AND file_path = $path"
+                : "DELETE FROM threads WHERE source = $source AND file_path = $path AND native_id <> $keep";
+            command.Parameters.AddWithValue("$source", source);
+            command.Parameters.AddWithValue("$path", path);
+            if (keepNativeId is not null)
+            {
+                command.Parameters.AddWithValue("$keep", keepNativeId);
+            }
+
+            command.ExecuteNonQuery();
+        }
+    }
+
     public void UpsertThread(ThreadRecord thread)
     {
         lock (_gate)
