@@ -1,10 +1,9 @@
-using System.Collections.Concurrent;
 using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 
 /// <summary>
-/// 収集、活動化、PR照会、台帳提案を順に行う。LLMとghは呼び出し側が差し替える。
+/// 選択済みの依頼と最後の応答だけを解析し、台帳の差分があるときだけ更新する。
+/// LLM と gh は呼び出し側が差し替える。estimate は API を呼ばない。
 /// </summary>
 internal static class StatusPipeline
 {
@@ -20,20 +19,29 @@ internal static class StatusPipeline
         try
         {
             skips.AddRange(Ingest(request));
-            var packets = BuildPackets(request.Store, request.Window);
-            var views = await AnalyzeAsync(request, packets, cancellationToken);
-            await RefreshTrackedAsync(request, views, cancellationToken);
-            var concentrations = await ConcentrateAsync(request, views, cancellationToken);
-            IReadOnlyList<LedgerChange> changes = [];
-            IReadOnlyList<HoldNote> holds = [];
-            if (views.Count > 0)
+            var threads = request.Store.ListThreads();
+            if (request.EstimateOnly)
             {
-                var cards = CardParser.LoadRepository(request.Config.LedgerRepository);
-                (changes, holds) = await LedgerPlanner.PlanAsync(cards, views, request.Store, request.Model, cancellationToken);
+                var estimate = DescribeEstimate(request, threads);
+                reportPath = WriteEstimate(request, runId, estimate, skips);
+                request.Store.FinishRun(runId, "succeeded", reportPath, null);
+                return new RunResult
+                {
+                    RunId = runId,
+                    ReportPath = reportPath,
+                    AppliedCards = [],
+                    ExitCode = 0,
+                    SkippedLogs = skips,
+                    EstimatedInputTokens = estimate.InputTokens,
+                    PlannedCalls = estimate.AssessCalls + estimate.ReconcileCalls,
+                    Estimated = true,
+                };
             }
 
-            var staged = StampBlobs(request.Config.LedgerRepository, changes);
-            proposalPath = WriteProposal(request.Config, runId, staged, views);
+            var cards = CardParser.LoadRepository(request.Config.LedgerRepository);
+            var plan = await PlanAsync(request, threads, cards, cancellationToken);
+            var staged = StampBlobs(request.Config.LedgerRepository, plan.Changes);
+            proposalPath = WriteProposal(request.Config, runId, staged);
             var applied = new List<string>();
             string? stop = null;
             var exit = 0;
@@ -51,7 +59,7 @@ internal static class StatusPipeline
             }
 
             var usage = request.Store.UsageTotals(runId);
-            reportPath = WriteReport(request, runId, views, holds, concentrations, LedgerText(request.ApplyLedger, staged, applied, stop), usage, skips);
+            reportPath = WriteReport(request, runId, plan, LedgerText(request.ApplyLedger, staged, applied, stop), usage, skips);
             request.Store.FinishRun(runId, exit == 0 ? "succeeded" : "failed", reportPath, proposalPath);
             return new RunResult
             {
@@ -133,7 +141,6 @@ internal static class StatusPipeline
             IngestRoot(request, request.Config.CodexArchivedSessionsDir, "codex", searchAllDirectories: true, skips);
         }
 
-        IngestRoot(request, request.Config.FacadeRunsDir, "facade", searchAllDirectories: false, skips);
         return skips;
     }
 
@@ -144,13 +151,15 @@ internal static class StatusPipeline
             return;
         }
 
-        var pattern = source == "codex" ? "rollout-*.jsonl" : "*.events.jsonl";
+        var pattern = "rollout-*.jsonl";
         var option = searchAllDirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        foreach (var path in Directory.EnumerateFiles(root, pattern, option).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+        foreach (var path in Directory.EnumerateFiles(root, pattern, option).OrderBy(item => item, StringComparer.OrdinalIgnoreCase))
         {
             var info = new FileInfo(path);
             var cursor = request.Store.GetCursor(path);
-            if (cursor is not null &&
+            var versionReset = cursor is null || cursor.ScanVersion < Normalize.InputModelVersion;
+            if (!versionReset &&
+                cursor is not null &&
                 cursor.Size == info.Length &&
                 cursor.ByteOffset == info.Length &&
                 info.LastWriteTimeUtc < request.Window.FromUtc)
@@ -158,45 +167,20 @@ internal static class StatusPipeline
                 continue;
             }
 
-            var read = ByteLog.Read(path, cursor?.ByteOffset ?? 0, cursor?.Size ?? 0, cursor?.PrefixHash, cursor?.NextLine ?? 1);
+            var read = ByteLog.Read(
+                path,
+                versionReset ? 0 : cursor?.ByteOffset ?? 0,
+                versionReset ? 0 : cursor?.Size ?? 0,
+                versionReset ? null : cursor?.PrefixHash,
+                versionReset ? 1 : cursor?.NextLine ?? 1);
             if (read.DecodeError is not null)
             {
                 skips.Add(new IngestSkip(path, null, read.DecodeError));
             }
 
-            if (read.Reset)
-            {
-                request.Store.DeleteObservationsForFile(path);
-            }
-
-            var carry = new ParseCarry
-            {
-                NativeId = read.Reset ? null : cursor?.NativeId,
-                Repository = read.Reset ? null : cursor?.Repository,
-                Cwd = read.Reset ? null : cursor?.Cwd,
-                LastEvent = read.Reset ? null : cursor?.LastEventUtc,
-                Terminal = !read.Reset && (cursor?.Terminal ?? false),
-            };
-            foreach (var line in read.Lines)
-            {
-                ObservationDraft? draft;
-                try
-                {
-                    draft = source == "codex"
-                        ? CodexCollector.ParseLine(path, line, carry)
-                        : FacadeCollector.ParseLine(path, line, carry);
-                }
-                catch (InvalidLogLineException ex)
-                {
-                    skips.Add(new IngestSkip(path, line.Number, ex.Message));
-                    continue;
-                }
-
-                if (draft is not null)
-                {
-                    request.Store.UpsertObservation(draft);
-                }
-            }
+            var working = cursor ?? new FileCursor();
+            var rebuild = versionReset || read.Reset;
+            ReadCodex(request, path, read, working, rebuild, skips);
 
             request.Store.SaveCursor(path, source, new FileCursor
             {
@@ -204,83 +188,141 @@ internal static class StatusPipeline
                 Size = read.Size,
                 PrefixHash = read.PrefixHash,
                 NextLine = read.NextLine,
-                NativeId = carry.NativeId,
-                Repository = carry.Repository,
-                Cwd = carry.Cwd,
-                LastEventUtc = carry.LastEvent,
-                Terminal = carry.Terminal,
+                NativeId = working.NativeId,
+                Repository = working.Repository,
+                Cwd = working.Cwd,
+                LastEventUtc = working.LastEventUtc,
+                Terminal = working.Terminal,
+                ScanVersion = Normalize.InputModelVersion,
             });
         }
     }
 
-    private static List<SourcePacket> BuildPackets(StateStore store, TimeWindow window)
+    private static void ReadCodex(RunRequest request, string path, ByteLog.ReadResult read, FileCursor cursor, bool rebuild, List<IngestSkip> skips)
     {
-        var natives = store.ListNativeIdsInWindow(window.FromUtc, window.ToUtcExclusive);
-        var consumed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var packets = new List<SourcePacket>();
-        foreach (var native in natives.Where(item => item.Source == "codex").OrderBy(item => item.NativeId, StringComparer.Ordinal))
+        var selection = new CodexSelection();
+        var seeded = !rebuild && !string.IsNullOrWhiteSpace(cursor.NativeId);
+        if (seeded)
         {
-            var observations = store.ListByNative("codex", native.NativeId).ToList();
-            var runIds = observations.SelectMany(item => item.Draft.RunIds).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            foreach (var runId in runIds)
-            {
-                var linked = store.ListByNative("facade", runId);
-                if (linked.Count == 0)
-                {
-                    continue;
-                }
-
-                observations.AddRange(linked);
-                consumed.Add(runId);
-            }
-
-            packets.Add(MakePacket(observations, native.NativeId, "codex", runIds));
+            SeedCodex(selection, request.Store.GetThread("codex", cursor.NativeId!));
         }
 
-        foreach (var native in natives.Where(item => item.Source == "facade").OrderBy(item => item.NativeId, StringComparer.Ordinal))
+        foreach (var line in read.Lines)
         {
-            if (consumed.Contains(native.NativeId))
+            try
             {
-                continue;
+                CodexCollector.Observe(line, selection);
             }
-
-            var observations = store.ListByNative("facade", native.NativeId);
-            packets.Add(MakePacket(observations, native.NativeId, "facade", [native.NativeId]));
+            catch (InvalidLogLineException ex)
+            {
+                skips.Add(new IngestSkip(path, line.Number, ex.Message));
+            }
         }
 
-        return packets;
+        if (string.IsNullOrWhiteSpace(selection.NativeId))
+        {
+            if (selection.Request is null && selection.Response is null && selection.FirstEvent is null)
+            {
+                return;
+            }
+
+            selection.NativeId = string.IsNullOrWhiteSpace(cursor.NativeId)
+                ? Path.GetFileNameWithoutExtension(path)
+                : cursor.NativeId;
+        }
+
+        var record = ToRecord("codex", path, selection.NativeId, selection.Repository, selection.Cwd, selection.Request, selection.Response, selection.FirstEvent, selection.LastEvent, request.Store, rebuild, seeded);
+        request.Store.UpsertThread(record);
+        cursor.NativeId = record.NativeId;
+        cursor.Repository = record.Repository;
+        cursor.Cwd = record.Cwd;
+        cursor.LastEventUtc = record.LastEventUtc;
     }
 
-    private static SourcePacket MakePacket(IReadOnlyList<StoredObservation> observations, string nativeId, string source, IReadOnlyList<string> runIds)
+    private static void SeedCodex(CodexSelection selection, ThreadRecord? stored)
     {
-        var ordered = observations
-            .OrderBy(item => item.Draft.Timestamp ?? DateTimeOffset.MinValue)
-            .ThenBy(item => item.Draft.Ordinal)
-            .ToList();
-        return new SourcePacket
+        if (stored is null)
         {
-            NativeId = nativeId,
+            return;
+        }
+
+        selection.NativeId = stored.NativeId;
+        selection.Repository = stored.Repository;
+        selection.Cwd = stored.Cwd;
+        selection.Request = stored.Request;
+        selection.Response = stored.Response;
+        selection.FirstEvent = stored.FirstEventUtc;
+        selection.LastEvent = stored.LastEventUtc;
+    }
+
+    private static ThreadRecord ToRecord(
+        string source,
+        string path,
+        string nativeId,
+        string? repository,
+        string? cwd,
+        SelectedExcerpt? request,
+        SelectedExcerpt? response,
+        DateTimeOffset? first,
+        DateTimeOffset? last,
+        StateStore store,
+        bool rebuild,
+        bool seeded)
+    {
+        var previous = store.GetThread(source, nativeId);
+        var authoritative = rebuild || seeded;
+        var requestExcerpt = Cap(request) ?? (authoritative ? null : previous?.Request);
+        var responseExcerpt = Cap(response) ?? (authoritative ? null : previous?.Response);
+        var fingerprint = Normalize.SelectionFingerprint(requestExcerpt, responseExcerpt);
+        var same = previous is not null && previous.Fingerprint.Length > 0 && previous.Fingerprint == fingerprint;
+        return new ThreadRecord
+        {
             Source = source,
-            Repository = ordered.Select(item => DetailString(item, "repository")).LastOrDefault(value => value is not null),
-            Cwd = ordered.Select(item => DetailString(item, "cwd")).LastOrDefault(value => value is not null),
-            LinkedRunIds = runIds,
-            Observations = ordered,
+            NativeId = nativeId,
+            FilePath = path,
+            Repository = string.IsNullOrWhiteSpace(repository) ? previous?.Repository : repository,
+            Cwd = string.IsNullOrWhiteSpace(cwd) ? previous?.Cwd : cwd,
+            Request = requestExcerpt,
+            Response = responseExcerpt,
+            FirstEventUtc = first ?? previous?.FirstEventUtc,
+            LastEventUtc = last ?? previous?.LastEventUtc,
+            Fingerprint = fingerprint,
+            Assessment = same ? previous!.Assessment : null,
+            MatchedPath = same ? previous!.MatchedPath : null,
+            MatchedWorkstream = same ? previous!.MatchedWorkstream : null,
+            ReconcileFingerprint = same ? previous!.ReconcileFingerprint : null,
         };
     }
 
-    private static async Task<List<ActivityView>> AnalyzeAsync(RunRequest request, IReadOnlyList<SourcePacket> packets, CancellationToken cancellationToken)
+    private static SelectedExcerpt? Cap(SelectedExcerpt? excerpt)
     {
-        var views = new ConcurrentBag<ActivityView>();
+        if (excerpt is null)
+        {
+            return null;
+        }
+
+        var text = Redaction.Apply(excerpt.Text).Trim();
+        if (text.Length > Normalize.StoredBodyLimit)
+        {
+            text = text[..Normalize.StoredBodyLimit];
+        }
+
+        return excerpt with { Text = text };
+    }
+
+    private static async Task<AnalysisPlan> PlanAsync(RunRequest request, IReadOnlyList<ThreadRecord> threads, IReadOnlyList<ProjectCard> cards, CancellationToken cancellationToken)
+    {
+        var holds = new List<HoldNote>();
+        var reports = new List<ThreadView>();
+        var eligible = threads.Where(thread => thread.Overlaps(request.Window) && thread.HasResponse && !IsSelf(thread)).ToList();
         var gate = new SemaphoreSlim(Math.Max(1, request.Config.MaxParallel));
-        var tasks = packets.Select(async packet =>
+        var assessed = new System.Collections.Concurrent.ConcurrentBag<ThreadRecord>();
+        var tasks = eligible.Select(async thread =>
         {
             await gate.WaitAsync(cancellationToken);
             try
             {
-                foreach (var view in await AnalyzePacketAsync(request, packet, cancellationToken))
-                {
-                    views.Add(view);
-                }
+                assessed.Add(await AssessOneAsync(request, thread, cancellationToken));
             }
             finally
             {
@@ -288,291 +330,415 @@ internal static class StatusPipeline
             }
         });
         await Task.WhenAll(tasks);
-        return views.OrderBy(view => view.Id, StringComparer.Ordinal).ToList();
-    }
 
-    private static async Task<IReadOnlyList<ActivityView>> AnalyzePacketAsync(RunRequest request, SourcePacket packet, CancellationToken cancellationToken)
-    {
-        var stored = request.Store.ListCurrentByNative(packet.NativeId);
-        if (CanReuse(packet.Observations, stored))
+        var byId = assessed.ToDictionary(thread => thread.Source + ":" + thread.NativeId, StringComparer.Ordinal);
+        var groups = new Dictionary<string, (ProjectCard Card, List<ThreadRecord> Threads)>(StringComparer.Ordinal);
+        foreach (var thread in byId.Values.OrderBy(thread => thread.NativeId, StringComparer.Ordinal))
         {
-            return stored.Select(view => view.ReplacePulls(view.PullRequests, view.Stages, true)).ToList();
-        }
-
-        var substantive = packet.Observations.Where(item => Normalize.IsSubstantiveKind(item.Draft.Kind)).ToList();
-        var selfObservations = substantive.Where(item => Normalize.IsSelfInvocation(item.Draft.Body)).ToList();
-        var otherObservations = substantive.Where(item => !Normalize.IsSelfInvocation(item.Draft.Body)).ToList();
-        var produced = new List<ActivityView>();
-        if (selfObservations.Count > 0 && otherObservations.Count == 0)
-        {
-            produced.AddRange(await MaterializeAsync(request, packet, packet.Observations, SelfExtraction(packet.Observations), coverageFromModel: true, forceSelf: true, cancellationToken));
-        }
-        else if (selfObservations.Count > 0)
-        {
-            var selfPacket = CopyPacket(packet, selfObservations);
-            produced.AddRange(await MaterializeAsync(request, selfPacket, selfObservations, SelfExtraction(selfObservations), coverageFromModel: true, forceSelf: true, cancellationToken));
-            var rest = packet.Observations.Where(item => selfObservations.All(self => self.Id != item.Id)).ToList();
-            produced.AddRange(await ExtractViewsAsync(request, CopyPacket(packet, rest), cancellationToken));
-        }
-        else
-        {
-            produced.AddRange(await ExtractViewsAsync(request, packet, cancellationToken));
-        }
-
-        var freshIds = produced.Select(view => view.Id).ToHashSet(StringComparer.Ordinal);
-        foreach (var view in produced)
-        {
-            request.Store.UpsertActivity(view);
-            foreach (var pull in view.PullRequests)
+            var candidates = Candidates(thread);
+            var match = MatchCard(thread, candidates, cards);
+            if (match.Card is null)
             {
-                request.Store.UpsertPull(pull, view.Id);
-            }
-        }
-
-        if (produced.Count > 0)
-        {
-            foreach (var old in stored)
-            {
-                if (!freshIds.Contains(old.Id))
+                if (match.Hold is not null)
                 {
-                    request.Store.MarkReplaced(old.Id, produced[0].Id);
+                    holds.Add(match.Hold);
                 }
+
+                reports.Add(new ThreadView { Thread = thread, Assessment = thread.Assessment, Pulls = [] });
+                continue;
             }
-        }
 
-        return produced;
-    }
-
-    private static async Task<IReadOnlyList<ActivityView>> ExtractViewsAsync(RunRequest request, SourcePacket packet, CancellationToken cancellationToken)
-    {
-        var limit = request.MaxPacketChars ?? Normalize.PacketCharLimit;
-        var slices = PacketSplitter.Split(packet.Observations, limit);
-        var extracted = new List<ExtractedActivity>();
-        string? previous = null;
-        for (var index = 0; index < slices.Count; index++)
-        {
-            var slice = CopyPacket(packet, slices[index]);
-            var part = await request.Model.ExtractAsync(new ActivityPacket
+            if (!groups.TryGetValue(match.Card.RelativePath, out var group))
             {
-                PacketId = packet.NativeId + ":" + index.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                NativeId = slice.NativeId,
-                Source = slice.Source,
-                Repository = slice.Repository,
-                Cwd = slice.Cwd,
-                ExistingSummary = previous,
-                Observations = slice.Observations,
-                LinkedRunIds = slice.LinkedRunIds,
-            }, cancellationToken);
-            extracted.AddRange(part);
-            previous = string.Join(" / ", part.Select(item => item.Summary));
+                group = (match.Card, []);
+            }
+
+            group.Threads.Add(thread);
+            groups[match.Card.RelativePath] = group;
         }
 
-        return await MaterializeAsync(request, packet, packet.Observations, extracted, extracted.Count > 0, forceSelf: false, cancellationToken);
+        foreach (var tracked in await RefreshOutsideWindowAsync(request, threads, eligible, cards, cancellationToken))
+        {
+            if (groups.ContainsKey(tracked.Card.RelativePath))
+            {
+                continue;
+            }
+
+            if (tracked.Thread.Assessment is null || string.IsNullOrWhiteSpace(tracked.Thread.MatchedWorkstream))
+            {
+                continue;
+            }
+
+            groups[tracked.Card.RelativePath] = (tracked.Card, [tracked.Thread]);
+        }
+
+        var snapshots = await QueryPullsAsync(
+            request,
+            groups.Values.SelectMany(group => group.Threads.SelectMany(thread => Candidates(thread).Select(reference => (reference, thread.Source + ":" + thread.NativeId)))),
+            cancellationToken);
+        var changes = new List<LedgerChange>();
+        foreach (var group in groups.Values)
+        {
+            var views = group.Threads.Select(thread => new ThreadView
+            {
+                Thread = thread,
+                Assessment = thread.Assessment,
+                Pulls = ChoosePulls(thread, snapshots),
+            }).ToList();
+            reports.AddRange(views);
+            if (views.Any(view => view.Assessment is null))
+            {
+                continue;
+            }
+
+            if (TryFastComplete(group.Card, views, out var fast))
+            {
+                if (fast is not null)
+                {
+                    changes.Add(fast);
+                }
+
+                Remember(request.Store, group.Card, views, fast);
+                continue;
+            }
+
+            var hash = ReconcileHash(group.Card.Text, views);
+            if (views.All(view => view.Thread.ReconcileFingerprint == hash))
+            {
+                continue;
+            }
+
+            var updates = await ModelOf(request).ReconcileAsync(ThreadPrompts.ReconcileSystem, ThreadPrompts.ReconcileUser(group.Card, views), cancellationToken);
+            var change = LedgerPlanner.Apply(group.Card, views, updates);
+            if (change is not null)
+            {
+                changes.Add(change);
+            }
+
+            Remember(request.Store, group.Card, views, change);
+        }
+
+        return new AnalysisPlan(reports, holds, changes);
     }
 
-    private static async Task<IReadOnlyList<ActivityView>> MaterializeAsync(
+    private static async Task<ThreadRecord> AssessOneAsync(RunRequest request, ThreadRecord thread, CancellationToken cancellationToken)
+    {
+        if (thread.Assessment is not null)
+        {
+            return thread;
+        }
+
+        var candidates = Candidates(thread);
+        var assessment = await ModelOf(request).AssessAsync(ThreadPrompts.AssessSystem, ThreadPrompts.AssessUser(thread, candidates), cancellationToken);
+        var allowed = candidates.Select(candidate => candidate.Url).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var selected = assessment.SelectedPullUrls.Where(url => allowed.Contains(url)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (selected.Count == 0 && candidates.Count == 1)
+        {
+            selected.Add(candidates[0].Url);
+        }
+
+        var remaining = assessment.ExplicitRemainingWork.Trim();
+        if (remaining.Length == 0 || thread.Response is null || !thread.Response.Text.Contains(remaining, StringComparison.Ordinal))
+        {
+            remaining = "";
+        }
+
+        var confirmed = new ThreadAssessment
+        {
+            Summary = assessment.Summary,
+            Purpose = assessment.Purpose,
+            CurrentPosition = assessment.CurrentPosition,
+            ExplicitRemainingWork = remaining,
+            NextAction = assessment.NextAction,
+            Uncertainty = assessment.Uncertainty,
+            SelectedPullUrls = selected,
+        };
+        var saved = Copy(thread, confirmed);
+        request.Store.UpsertThread(saved);
+        return saved;
+    }
+
+    private static bool TryFastComplete(ProjectCard card, IReadOnlyList<ThreadView> views, out LedgerChange? change)
+    {
+        change = null;
+        if (views.Count != 1 || !LedgerPlanner.CanDelete(views))
+        {
+            return false;
+        }
+
+        var view = views[0];
+        var heading = view.Thread.MatchedWorkstream;
+        if (string.IsNullOrWhiteSpace(heading) || card.Workstreams.All(workstream => workstream.Heading != heading))
+        {
+            return false;
+        }
+
+        change = LedgerPlanner.Apply(card, views, [new LedgerFieldUpdate(heading, "delete", "", "", "", "")]);
+        return true;
+    }
+
+    private static void Remember(StateStore store, ProjectCard card, IReadOnlyList<ThreadView> views, LedgerChange? change)
+    {
+        var basis = change?.NewText ?? card.Text;
+        var hash = ReconcileHash(basis, views);
+        foreach (var view in views)
+        {
+            if (view.Assessment is null)
+            {
+                continue;
+            }
+
+            var decision = change?.Decisions.FirstOrDefault(item => item.ActivityId == view.Thread.Source + ":" + view.Thread.NativeId);
+            store.SaveAssessment(view.Thread.Source, view.Thread.NativeId, view.Assessment, card.RelativePath, decision?.Workstream ?? view.Thread.MatchedWorkstream, hash);
+        }
+    }
+
+    private static async Task<IReadOnlyList<(ProjectCard Card, ThreadRecord Thread)>> RefreshOutsideWindowAsync(
         RunRequest request,
-        SourcePacket packet,
-        IReadOnlyList<StoredObservation> observations,
-        IReadOnlyList<ExtractedActivity> extracted,
-        bool coverageFromModel,
-        bool forceSelf,
+        IReadOnlyList<ThreadRecord> threads,
+        IReadOnlyList<ThreadRecord> eligible,
+        IReadOnlyList<ProjectCard> cards,
         CancellationToken cancellationToken)
     {
-        var grouped = ActivityGrouping.Group(observations, extracted);
-        var omitted = observations.Any(HasOmittedTail);
-        var coverage = coverageFromModel && !omitted;
-        var views = new List<ActivityView>();
-        foreach (var activity in grouped)
-        {
-            var snapshots = new List<PullRequestSnapshot>();
-            foreach (var reference in activity.Refs.Where(reference => reference.Kind == "pull"))
-            {
-                snapshots.Add(await request.Pulls.GetAsync(reference.Owner, reference.Repository, reference.Number, cancellationToken));
-            }
-
-            var used = observations.Where(item => activity.ObservationIds.Contains(item.Id, StringComparer.Ordinal)).ToList();
-            var self = forceSelf || IsSelf(used);
-            views.Add(ToView(activity, packet, snapshots, coverage, self ? "status_check_self" : "normal", true));
-        }
-
-        return views;
-    }
-
-    private static ActivityView ToView(GroupedActivity activity, SourcePacket packet, IReadOnlyList<PullRequestSnapshot> pulls, bool coverage, string kind, bool inWindow)
-    {
-        var stages = activity.Stages.ToList();
-        foreach (var pull in pulls)
-        {
-            stages.Add(pull.State switch
-            {
-                PullRequestState.Merged => StageNames.PrMerged,
-                PullRequestState.Open => StageNames.PrOpen,
-                _ => StageNames.PrClosedUnmerged,
-            });
-        }
-
-        var evidence = activity.ObservationIds.ToList();
-        evidence.Add(packet.Source + ":" + packet.NativeId);
-        foreach (var runId in packet.LinkedRunIds)
-        {
-            evidence.Add("run:" + runId);
-        }
-
-        return new ActivityView
-        {
-            Id = activity.Id,
-            Summary = activity.Summary,
-            Purpose = activity.Purpose,
-            Repository = packet.Repository ?? "",
-            Stages = stages,
-            PeriodChange = activity.PeriodChange,
-            CurrentPosition = activity.CurrentPosition,
-            Kind = kind,
-            InWindow = inWindow,
-            Evidence = evidence,
-            Uncertainty = activity.Uncertainty,
-            PullRequests = pulls,
-            IssueRefs = activity.Refs.Where(reference => reference.Kind == "issue").ToList(),
-            ExplicitRemainingWork = activity.ExplicitRemainingWork,
-            DiscoveredFrom = activity.DiscoveredFrom,
-            NextAction = activity.NextAction,
-            Confidence = activity.Confidence,
-            Cwd = packet.Cwd,
-            ObservationIds = activity.ObservationIds,
-            NativeId = packet.NativeId,
-            CoverageComplete = coverage,
-        };
-    }
-
-    private static async Task RefreshTrackedAsync(RunRequest request, List<ActivityView> views, CancellationToken cancellationToken)
-    {
+        var inside = eligible.Select(thread => thread.Source + ":" + thread.NativeId).ToHashSet(StringComparer.Ordinal);
+        var extra = new List<(ProjectCard, ThreadRecord)>();
         foreach (var tracked in request.Store.ListUnmergedTracked())
         {
-            if (tracked.ActivityId is null || views.Any(view => view.Id == tracked.ActivityId))
+            PullRequestSnapshot fresh;
+            try
             {
-                var freshKnown = await request.Pulls.GetAsync(tracked.Snapshot.Owner, tracked.Snapshot.Repository, tracked.Snapshot.Number, cancellationToken);
-                request.Store.UpsertPull(freshKnown, tracked.ActivityId);
-                if (tracked.ActivityId is null)
-                {
-                    continue;
-                }
-
-                var index = views.FindIndex(view => view.Id == tracked.ActivityId);
-                if (index < 0)
-                {
-                    continue;
-                }
-
-                views[index] = Overlay(views[index], freshKnown, true);
-                request.Store.UpsertActivity(views[index]);
+                fresh = await PullsOf(request).GetAsync(tracked.Snapshot.Owner, tracked.Snapshot.Repository, tracked.Snapshot.Number, cancellationToken);
+            }
+            catch (StatusCheckException)
+            {
                 continue;
             }
 
-            var fresh = await request.Pulls.GetAsync(tracked.Snapshot.Owner, tracked.Snapshot.Repository, tracked.Snapshot.Number, cancellationToken);
             request.Store.UpsertPull(fresh, tracked.ActivityId);
-            if (fresh.State == tracked.Snapshot.State && fresh.MergedAt == tracked.Snapshot.MergedAt)
+            if (fresh.State != PullRequestState.Merged || string.IsNullOrWhiteSpace(tracked.ActivityId) || inside.Contains(tracked.ActivityId))
             {
                 continue;
             }
 
-            var existing = request.Store.ListCurrentActivities().FirstOrDefault(view => view.Id == tracked.ActivityId);
-            if (existing is null)
+            var parts = tracked.ActivityId.Split(':', 2);
+            if (parts.Length != 2)
             {
                 continue;
             }
 
-            var updated = Overlay(existing, fresh, false);
-            request.Store.UpsertActivity(updated);
-            views.Add(updated);
-        }
-    }
-
-    private static ActivityView Overlay(ActivityView view, PullRequestSnapshot fresh, bool inWindow)
-    {
-        var pulls = view.PullRequests.Select(pull => pull.Url.Equals(fresh.Url, StringComparison.OrdinalIgnoreCase) ? fresh : pull).ToList();
-        if (pulls.All(pull => !pull.Url.Equals(fresh.Url, StringComparison.OrdinalIgnoreCase)))
-        {
-            pulls.Add(fresh);
-        }
-
-        var stages = view.Stages.Where(stage => stage is not (StageNames.PrOpen or StageNames.PrMerged or StageNames.PrClosedUnmerged)).ToList();
-        foreach (var pull in pulls)
-        {
-            stages.Add(pull.State switch
+            var thread = threads.FirstOrDefault(item => item.Source == parts[0] && item.NativeId == parts[1]);
+            if (thread?.Assessment is null || !string.IsNullOrWhiteSpace(thread.Assessment.ExplicitRemainingWork))
             {
-                PullRequestState.Merged => StageNames.PrMerged,
-                PullRequestState.Open => StageNames.PrOpen,
-                _ => StageNames.PrClosedUnmerged,
-            });
+                continue;
+            }
+
+            var card = cards.FirstOrDefault(item => item.RelativePath == thread.MatchedPath)
+                ?? cards.FirstOrDefault(item => item.Text.Contains(fresh.Url, StringComparison.OrdinalIgnoreCase));
+            if (card is null)
+            {
+                continue;
+            }
+
+            extra.Add((card, thread));
         }
 
-        return view.ReplacePulls(pulls, stages, inWindow);
+        return extra;
     }
 
-    private static async Task<IReadOnlyList<ConcentrationItem>> ConcentrateAsync(RunRequest request, IReadOnlyList<ActivityView> views, CancellationToken cancellationToken)
+    private static async Task<Dictionary<string, PullRequestSnapshot>> QueryPullsAsync(
+        RunRequest request,
+        IEnumerable<(GitHubRef Reference, string ActivityId)> pairs,
+        CancellationToken cancellationToken)
     {
-        var eligible = views.Where(view => view.Kind != "status_check_self" && view.InWindow).ToList();
-        if (eligible.Count == 0)
+        var snapshots = new Dictionary<string, PullRequestSnapshot>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in pairs.GroupBy(item => item.Reference.Url, StringComparer.OrdinalIgnoreCase).Select(group => group.First()))
         {
-            return [];
+            if (snapshots.ContainsKey(pair.Reference.Url))
+            {
+                continue;
+            }
+
+            var snapshot = await PullsOf(request).GetAsync(pair.Reference.Owner, pair.Reference.Repository, pair.Reference.Number, cancellationToken);
+            snapshots[snapshot.Url] = snapshot;
+            request.Store.UpsertPull(snapshot, pair.ActivityId);
         }
 
-        var allowed = eligible.Select(view => view.Id).ToHashSet(StringComparer.Ordinal);
-        var items = await request.Model.ConcentrateAsync(eligible, cancellationToken);
-        return items.Where(item => allowed.Contains(item.ActivityId)).Take(10).ToList();
+        return snapshots;
     }
 
-    private static bool CanReuse(IReadOnlyList<StoredObservation> observations, IReadOnlyList<ActivityView> stored)
+    private static IActivityModel ModelOf(RunRequest request) =>
+        request.Model ?? throw new StatusCheckException("A model is required.");
+
+    private static IPullRequestSource PullsOf(RunRequest request) =>
+        request.Pulls ?? throw new StatusCheckException("A pull request source is required.");
+
+    private static EstimateReport DescribeEstimate(RunRequest request, IReadOnlyList<ThreadRecord> threads)
     {
-        if (stored.Count == 0)
+        IReadOnlyList<ProjectCard> cards;
+        try
         {
-            return false;
+            cards = CardParser.LoadRepository(request.Config.LedgerRepository);
+        }
+        catch (StatusCheckException)
+        {
+            cards = [];
         }
 
-        var packetIds = observations.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
-        var storedIds = stored.SelectMany(item => item.ObservationIds).ToHashSet(StringComparer.Ordinal);
-        if (!packetIds.SetEquals(storedIds))
+        var overlapping = threads.Where(thread => thread.Overlaps(request.Window)).ToList();
+        var prompts = new List<(string Stage, string System, string User)>();
+        var groups = new Dictionary<string, (ProjectCard Card, List<ThreadRecord> Threads)>(StringComparer.Ordinal);
+        foreach (var thread in overlapping.Where(thread => thread.HasResponse && !IsSelf(thread)))
         {
-            return false;
+            if (thread.Assessment is null)
+            {
+                prompts.Add(("assess", ThreadPrompts.AssessSystem, ThreadPrompts.AssessUser(thread, Candidates(thread))));
+            }
+
+            var match = MatchCard(thread, Candidates(thread), cards);
+            if (match.Card is null)
+            {
+                continue;
+            }
+
+            if (!groups.TryGetValue(match.Card.RelativePath, out var group))
+            {
+                group = (match.Card, []);
+            }
+
+            group.Threads.Add(thread);
+            groups[match.Card.RelativePath] = group;
         }
 
-        return stored.All(view => view.CoverageComplete || view.Kind == "status_check_self" || view.ObservationIds.Any(id => HasOmittedTail(observations.First(item => item.Id == id))));
-    }
-
-    private static bool IsSelf(IReadOnlyList<StoredObservation> observations)
-    {
-        var substantive = observations.Where(item => Normalize.IsSubstantiveKind(item.Draft.Kind)).ToList();
-        return substantive.Count > 0 && substantive.All(item => Normalize.IsSelfInvocation(item.Draft.Body));
-    }
-
-    private static IReadOnlyList<ExtractedActivity> SelfExtraction(IReadOnlyList<StoredObservation> observations) =>
-    [
-        new ExtractedActivity
+        foreach (var group in groups.Values)
         {
-            ObservationIds = observations.Select(item => item.Id).ToList(),
-            IndependentIssue = false,
-            Summary = "このツールの分析実行",
-            Purpose = "status check",
-            Stages = [],
-            PeriodChange = "分析コマンドを実行した。",
-            CurrentPosition = "分析実行であり、他のProjectの完了には使わない。",
-            ExplicitRemainingWork = "",
-            Uncertainty = "",
-            Confidence = 1,
-            NextAction = "",
-            UncertainMerge = false,
-        },
-    ];
+            var views = group.Threads.Select(thread => new ThreadView
+            {
+                Thread = thread,
+                Assessment = thread.Assessment,
+                Pulls = Candidates(thread).Select(candidate => new PullRequestSnapshot(candidate.Url, candidate.Owner, candidate.Repository, candidate.Number, PullRequestState.Open, null, null, "")).ToList(),
+            }).ToList();
+            var hash = ReconcileHash(group.Card.Text, views);
+            if (views.All(view => view.Assessment is not null && view.Thread.ReconcileFingerprint == hash))
+            {
+                continue;
+            }
 
-    private static SourcePacket CopyPacket(SourcePacket packet, IReadOnlyList<StoredObservation> observations) => new()
+            prompts.Add(("reconcile", ThreadPrompts.ReconcileSystem, ThreadPrompts.ReconcileUser(group.Card, views)));
+        }
+
+        var payloadChars = prompts.Sum(prompt => prompt.System.Length + prompt.User.Length);
+        return new EstimateReport(
+            overlapping.Count,
+            overlapping.Count(thread => thread.HasResponse),
+            overlapping.Count(thread => !thread.HasResponse),
+            overlapping.Sum(thread => thread.Request?.Text.Length ?? 0),
+            overlapping.Sum(thread => thread.Response?.Text.Length ?? 0),
+            prompts.Count(prompt => prompt.Stage == "assess"),
+            prompts.Count(prompt => prompt.Stage == "reconcile"),
+            payloadChars,
+            prompts.Sum(prompt => Pricing.EstimateInputTokens(prompt.System.Length + prompt.User.Length)),
+            overlapping,
+            prompts.Any(prompt => prompt.User.Contains("tool_call_update", StringComparison.Ordinal)));
+    }
+
+    private static (ProjectCard? Card, HoldNote? Hold) MatchCard(ThreadRecord thread, IReadOnlyList<GitHubRef> candidates, IReadOnlyList<ProjectCard> cards)
     {
-        NativeId = packet.NativeId,
-        Source = packet.Source,
-        Repository = packet.Repository,
-        Cwd = packet.Cwd,
-        LinkedRunIds = packet.LinkedRunIds,
-        Observations = observations,
+        var activityId = thread.Source + ":" + thread.NativeId;
+        var urls = candidates.Select(candidate => candidate.Url).ToList();
+        var urlCards = cards.Where(card => urls.Any(url => card.Text.Contains(url, StringComparison.OrdinalIgnoreCase))).ToList();
+        if (urlCards.Count == 1)
+        {
+            return (urlCards[0], null);
+        }
+
+        if (urlCards.Count > 1)
+        {
+            return (null, new HoldNote { ActivityId = activityId, Reason = "PRのURLが複数のProjectカードに現れている。" });
+        }
+
+        if (!string.IsNullOrWhiteSpace(thread.Repository))
+        {
+            var repoCards = cards.Where(card => card.Repositories.Contains(thread.Repository, StringComparer.OrdinalIgnoreCase)).ToList();
+            if (repoCards.Count == 1)
+            {
+                return (repoCards[0], null);
+            }
+
+            return (null, new HoldNote { ActivityId = activityId, Reason = "repositoryに一致するProjectカードを一意に決められない。" });
+        }
+
+        return (null, new HoldNote { ActivityId = activityId, Reason = "repositoryもURLも一致しない。" });
+    }
+
+    private static IReadOnlyList<GitHubRef> Candidates(ThreadRecord thread)
+    {
+        var text = (thread.Request?.Text ?? "") + "\n" + (thread.Response?.Text ?? "");
+        var found = Normalize.PullCandidates(text, thread.Repository).ToList();
+        if (thread.Assessment is not null)
+        {
+            foreach (var url in thread.Assessment.SelectedPullUrls)
+            {
+                var parsed = Normalize.GitHubRefs(url).FirstOrDefault(reference => reference.Kind == "pull");
+                if (parsed is not null && found.All(item => !item.Url.Equals(parsed.Url, StringComparison.OrdinalIgnoreCase)))
+                {
+                    found.Add(parsed);
+                }
+            }
+        }
+
+        return found;
+    }
+
+    private static IReadOnlyList<PullRequestSnapshot> ChoosePulls(ThreadRecord thread, IReadOnlyDictionary<string, PullRequestSnapshot> snapshots)
+    {
+        var candidates = Candidates(thread);
+        var selected = thread.Assessment?.SelectedPullUrls ?? [];
+        var chosen = candidates.Where(candidate => selected.Contains(candidate.Url, StringComparer.OrdinalIgnoreCase)).ToList();
+        if (chosen.Count == 0 && candidates.Count == 1)
+        {
+            chosen = [candidates[0]];
+        }
+
+        var pulls = new List<PullRequestSnapshot>();
+        foreach (var candidate in chosen)
+        {
+            if (snapshots.TryGetValue(candidate.Url, out var snapshot))
+            {
+                pulls.Add(snapshot);
+            }
+        }
+
+        return pulls;
+    }
+
+    private static bool IsSelf(ThreadRecord thread) =>
+        Normalize.IsSelfInvocation(thread.Request?.Text) || Normalize.IsSelfInvocation(thread.Response?.Text);
+
+    private static string ReconcileHash(string cardText, IReadOnlyList<ThreadView> views)
+    {
+        var body = cardText + "\n" + string.Join(
+            "\n",
+            views.OrderBy(view => view.Thread.NativeId, StringComparer.Ordinal)
+                .Select(view => view.Thread.Fingerprint + "\n" + (view.Assessment?.ToJson() ?? "") + "\n" + string.Join(",", view.Pulls.OrderBy(pull => pull.Url, StringComparer.Ordinal).Select(pull => pull.Url + ":" + pull.State))));
+        return Normalize.Sha256Hex(body);
+    }
+
+    private static ThreadRecord Copy(ThreadRecord thread, ThreadAssessment assessment) => new()
+    {
+        Source = thread.Source,
+        NativeId = thread.NativeId,
+        FilePath = thread.FilePath,
+        Repository = thread.Repository,
+        Cwd = thread.Cwd,
+        Request = thread.Request,
+        Response = thread.Response,
+        FirstEventUtc = thread.FirstEventUtc,
+        LastEventUtc = thread.LastEventUtc,
+        Fingerprint = thread.Fingerprint,
+        Assessment = assessment,
+        MatchedPath = thread.MatchedPath,
+        MatchedWorkstream = thread.MatchedWorkstream,
+        ReconcileFingerprint = null,
     };
 
     private static List<LedgerChange> StampBlobs(string repository, IReadOnlyList<LedgerChange> changes)
@@ -586,6 +752,7 @@ internal static class StatusPipeline
                 BlobBefore = LedgerGit.Hash(repository, change.RelativePath),
                 NewText = change.NewText,
                 Decisions = change.Decisions,
+                Pulls = change.Pulls,
             });
         }
 
@@ -627,7 +794,7 @@ internal static class StatusPipeline
         return changes.Select(change => change.RelativePath).ToList();
     }
 
-    private static string WriteReport(RunRequest request, string runId, IReadOnlyList<ActivityView> views, IReadOnlyList<HoldNote> holds, IReadOnlyList<ConcentrationItem> concentrations, string ledgerSummary, (int InputTokens, int OutputTokens, decimal Usd) usage, IReadOnlyList<IngestSkip> skips)
+    private static string WriteReport(RunRequest request, string runId, AnalysisPlan plan, string ledgerSummary, (int InputTokens, int OutputTokens, decimal Usd) usage, IReadOnlyList<IngestSkip> skips)
     {
         var directory = Path.Combine(request.Config.ReportsDirectory, runId);
         Directory.CreateDirectory(directory);
@@ -636,9 +803,8 @@ internal static class StatusPipeline
         {
             Window = request.Window,
             QueriedAt = request.Now,
-            Activities = views,
-            Holds = holds,
-            Concentrations = concentrations,
+            Threads = plan.Reports,
+            Holds = plan.Holds,
             LedgerSummary = ledgerSummary,
             InputTokens = usage.InputTokens,
             OutputTokens = usage.OutputTokens,
@@ -649,23 +815,31 @@ internal static class StatusPipeline
         return path;
     }
 
-    private static string WriteProposal(AppConfig config, string runId, IReadOnlyList<LedgerChange> changes, IReadOnlyList<ActivityView> views)
+    private static string WriteEstimate(RunRequest request, string runId, EstimateReport estimate, IReadOnlyList<IngestSkip> skips)
+    {
+        var directory = Path.Combine(request.Config.ReportsDirectory, runId);
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "report.md");
+        File.WriteAllText(path, ReportWriter.WriteEstimate(request.Window, request.Now, estimate, skips), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        return path;
+    }
+
+    private static string WriteProposal(AppConfig config, string runId, IReadOnlyList<LedgerChange> changes)
     {
         var directory = Path.Combine(config.ReportsDirectory, runId);
         Directory.CreateDirectory(directory);
-        var involved = changes.SelectMany(change => change.Decisions).Select(decision => decision.ActivityId).ToHashSet(StringComparer.Ordinal);
         var pulls = new JsonArray();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var view in views.Where(view => involved.Contains(view.Id)))
+        foreach (var change in changes)
         {
-            foreach (var pull in view.PullRequests)
+            foreach (var pull in change.Pulls)
             {
                 if (!seen.Add(pull.Url))
                 {
                     continue;
                 }
 
-                JsonLists.AddObject(pulls, new JsonObject { ["url"] = pull.Url, ["state"] = pull.State.ToString() });
+                JsonLists.AddObject(pulls, new JsonObject { ["url"] = pull.Url, ["state"] = pull.State });
             }
         }
 
@@ -694,14 +868,8 @@ internal static class StatusPipeline
             });
         }
 
-        var root = new JsonObject
-        {
-            ["runId"] = runId,
-            ["pulls"] = pulls,
-            ["changes"] = changeArray,
-        };
         var path = Path.Combine(directory, "proposal.json");
-        File.WriteAllText(path, root.ToJsonString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        File.WriteAllText(path, new JsonObject { ["runId"] = runId, ["pulls"] = pulls, ["changes"] = changeArray }.ToJsonString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         return path;
     }
 
@@ -778,95 +946,6 @@ internal static class StatusPipeline
 
         return applied.Count == 0 ? "変更はない。" : "適用したカード: " + string.Join("、", applied);
     }
-
-    private static bool HasOmittedTail(StoredObservation observation)
-    {
-        if (JsonNode.Parse(observation.Draft.DetailJson) is not JsonObject obj)
-        {
-            return false;
-        }
-
-        return obj["omittedTail"]?.GetValue<bool>() == true;
-    }
-
-    private static string? DetailString(StoredObservation observation, string name)
-    {
-        if (JsonNode.Parse(observation.Draft.DetailJson) is not JsonObject obj || obj[name] is not JsonValue value || value.GetValueKind() != JsonValueKind.String)
-        {
-            return null;
-        }
-
-        var text = value.GetValue<string>();
-        return string.IsNullOrWhiteSpace(text) ? null : text;
-    }
-}
-
-internal static class PacketSplitter
-{
-    internal static IReadOnlyList<IReadOnlyList<StoredObservation>> Split(IReadOnlyList<StoredObservation> observations, int maxChars)
-    {
-        var slices = new List<IReadOnlyList<StoredObservation>>();
-        var current = new List<StoredObservation>();
-        var size = 0;
-        foreach (var observation in observations)
-        {
-            var length = observation.Draft.Body.Length + observation.Id.Length + 32;
-            if (length > maxChars)
-            {
-                if (current.Count > 0)
-                {
-                    slices.Add(current);
-                    current = [];
-                    size = 0;
-                }
-
-                var budget = Math.Max(1, maxChars - observation.Id.Length - 32);
-                var body = observation.Draft.Body;
-                for (var start = 0; start < body.Length; start += budget)
-                {
-                    var sliceLength = Math.Min(budget, body.Length - start);
-                    slices.Add([Slice(observation, body.Substring(start, sliceLength))]);
-                }
-
-                continue;
-            }
-
-            if (current.Count > 0 && size + length > maxChars)
-            {
-                slices.Add(current);
-                current = [];
-                size = 0;
-            }
-
-            current.Add(observation);
-            size += length;
-        }
-
-        if (current.Count > 0)
-        {
-            slices.Add(current);
-        }
-
-        return slices.Count == 0 ? [[]] : slices;
-    }
-
-    private static StoredObservation Slice(StoredObservation observation, string body) => new()
-    {
-        Id = observation.Id,
-        Draft = new ObservationDraft
-        {
-            Source = observation.Draft.Source,
-            NativeId = observation.Draft.NativeId,
-            FilePath = observation.Draft.FilePath,
-            Ordinal = observation.Draft.Ordinal,
-            Timestamp = observation.Draft.Timestamp,
-            Kind = observation.Draft.Kind,
-            Body = body,
-            DetailJson = observation.Draft.DetailJson,
-            Urls = observation.Draft.Urls,
-            RunIds = observation.Draft.RunIds,
-        },
-    };
 }
 
 internal sealed class RunRequest
@@ -874,12 +953,12 @@ internal sealed class RunRequest
     public required AppConfig Config { get; init; }
     public required TimeWindow Window { get; init; }
     public required bool ApplyLedger { get; init; }
-    public required IActivityModel Model { get; init; }
-    public required IPullRequestSource Pulls { get; init; }
+    public IActivityModel? Model { get; init; }
+    public IPullRequestSource? Pulls { get; init; }
     public required StateStore Store { get; init; }
     public DateTimeOffset Now { get; init; } = DateTimeOffset.UtcNow;
     public string? RunId { get; init; }
-    public int? MaxPacketChars { get; init; }
+    public bool EstimateOnly { get; init; }
 }
 
 internal sealed class RunResult
@@ -890,18 +969,26 @@ internal sealed class RunResult
     public string? StopReason { get; init; }
     public int ExitCode { get; init; }
     public IReadOnlyList<IngestSkip> SkippedLogs { get; init; } = [];
-}
-
-internal sealed class SourcePacket
-{
-    public required string NativeId { get; init; }
-    public required string Source { get; init; }
-    public string? Repository { get; init; }
-    public string? Cwd { get; init; }
-    public required IReadOnlyList<string> LinkedRunIds { get; init; }
-    public required IReadOnlyList<StoredObservation> Observations { get; init; }
+    public int EstimatedInputTokens { get; init; }
+    public int PlannedCalls { get; init; }
+    public bool Estimated { get; init; }
 }
 
 internal sealed record ProposalPull(string Url, string State);
 
 internal sealed record StoredProposal(string RunId, IReadOnlyList<ProposalPull> Pulls, IReadOnlyList<LedgerChange> Changes);
+
+internal sealed record AnalysisPlan(IReadOnlyList<ThreadView> Reports, IReadOnlyList<HoldNote> Holds, IReadOnlyList<LedgerChange> Changes);
+
+internal sealed record EstimateReport(
+    int Threads,
+    int WithResponse,
+    int WithoutResponse,
+    int RequestChars,
+    int ResponseChars,
+    int AssessCalls,
+    int ReconcileCalls,
+    int PayloadChars,
+    int InputTokens,
+    IReadOnlyList<ThreadRecord> Selected,
+    bool PayloadContainsToolUpdates);

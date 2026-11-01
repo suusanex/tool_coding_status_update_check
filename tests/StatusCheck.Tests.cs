@@ -9,9 +9,7 @@
 #:include ../src/ByteLog.cs
 #:include ../src/Store.cs
 #:include ../src/CodexCollector.cs
-#:include ../src/FacadeCollector.cs
 #:include ../src/GitHubClient.cs
-#:include ../src/ActivityGrouping.cs
 #:include ../src/Ledger.cs
 #:include ../src/OpenAiActivity.cs
 #:include ../src/Report.cs
@@ -21,31 +19,28 @@ using System.Text;
 using System.Text.Json.Nodes;
 
 var failures = new List<string>();
-await Case("grouping keeps overlapping independent issue", GroupingOverlap);
-await Case("grouping rejects an unconfirmed quote", GroupingUnconfirmed);
-await Case("grouping keeps disjoint quotes", GroupingDisjoint);
-await Case("overlapped remaining work stays on the parent", GroupingKeepsOverlappedRemainingWork);
-await Case("a config file name without a directory can be created", ConfigWithoutDirectory);
-await Case("an old file mtime does not drop in-window events", OldMtimeInWindow);
-await Case("an oversized observation is split under the packet limit", OversizedObservation);
-await Case("plan, start, and reported completion stay distinct", StageSentences);
-await Case("parent and facade stay one activity and keep an independent issue", ParentFacade);
-await Case("overlapping quote does not write the independent issue twice", OverlapHold);
-await Case("merged corresponding PR ignores an open reference URL", RefreshMerge);
-await Case("explicit remaining work stays on the workstream", ExplicitRemaining);
-await Case("remaining work past the display excerpt blocks completion", TailRemaining);
-await Case("incomplete coverage does not delete", IncompleteCoverage);
-await Case("model failure keeps the cursor and does not commit", ModelFailure);
-await Case("a remaining-work quote that more PRs are needed blocks completion", MultiplePrRemaining);
-await Case("an unmerged pull identifier blocks completion", UnmergedIdentifier);
+await Case("config can be created and old facade path is ignored", ConfigFile);
+await Case("first request and last answer are the only model text", SelectedPayload);
+await Case("a thread with no normal response does not update the ledger", NoNormalResponse);
+await Case("an old normal response survives later mid logs", ResponseSurvivesMidLogs);
+await Case("explicit remaining work is kept and tool text is not", ExplicitRemaining);
+await Case("an already matching card is not rewritten", AlreadyMatches);
+await Case("richer ledger text is kept", RicherText);
+await Case("a merged pull outside the window completes the workstream", RefreshMerge);
+await Case("closed unmerged does not delete", ClosedUnmerged);
+await Case("self invocation does not update and other work can be assessed", SelfAndDevelopment);
 await Case("unmatched repository does not change the card", Unmatched);
+await Case("two reports for one workstream do not stop the run", TwoReports);
 await Case("rerun does not add another commit", Rerun);
+await Case("apply writes the preview and rejects a changed pull", ApplyProposal);
+await Case("model failure keeps the cursor and does not commit", ModelFailure);
 await Case("an incomplete line is resumed once", IncompleteLine);
 await Case("invalid json does not stop the run", InvalidJsonContinues);
 await Case("invalid utf-8 chunk is skipped", InvalidUtf8Chunk);
+await Case("an old file mtime does not drop in-window events", OldMtimeInWindow);
+await Case("an old observation body is not sent", OldObservation);
+await Case("estimate counts the selected payload and does not call the model", EstimateOnly);
 await Case("openai failure keeps status and detail", OpenAiFailureMessage);
-await Case("closed unmerged is not merged", ClosedUnmerged);
-await Case("self invocation is excluded and tool development is kept", SelfAndDevelopment);
 
 if (failures.Count > 0)
 {
@@ -71,43 +66,7 @@ async Task Case(string name, Func<Task> body)
     }
 }
 
-Task GroupingOverlap()
-{
-    var body = "ウィジェットの実装を完了し、その過程で索引バグを見つけた。";
-    var grouped = ActivityGrouping.Group([Obs("obs1", body)], [Extracted("obs1", false, "親作業", "", "implementation_reported_complete"), Extracted("obs1", true, "独立課題", body, "new_issue"), Extracted("obs1", true, "独立課題", body, "new_issue")]);
-    var independent = grouped.Single(item => item.IndependentIssue);
-    var parent = grouped.Single(item => !item.IndependentIssue);
-    Check(grouped.Count == 2, "expected two activities");
-    Check(independent.DiscoveredFrom == parent.Id, "discoveredFrom was not the parent");
-    Check(!parent.Uncertainty.Contains("確認できない", StringComparison.Ordinal), "overlap was treated as unconfirmed");
-    Check(parent.Id != independent.Id, "shared evidence collapsed the activity id");
-    return Task.CompletedTask;
-}
-
-Task GroupingUnconfirmed()
-{
-    var body = "親の実装を完了した。";
-    var grouped = ActivityGrouping.Group([Obs("obs1", body)], [Extracted("obs1", false, "親作業", "", "implementation_reported_complete"), Extracted("obs1", true, "独立課題", "本文に存在しない引用", "new_issue")]);
-    Check(grouped.Count == 1, "unconfirmed split was kept");
-    Check(grouped[0].Uncertainty.Contains("確認できない", StringComparison.Ordinal), "missing uncertainty");
-    return Task.CompletedTask;
-}
-
-Task GroupingKeepsOverlappedRemainingWork()
-{
-    var body = "実装完了と報告する。残作業は索引を更新する。続きがある。";
-    var grouped = ActivityGrouping.Group(
-        [Obs("obs1", body)],
-        [
-            Extracted("obs1", false, "親作業", "", "implementation_reported_complete", "残作業は索引を更新する。"),
-            Extracted("obs1", true, "独立課題", "残作業は索引を更新する。", "new_issue"),
-        ]);
-    var parent = grouped.Single(item => !item.IndependentIssue);
-    Check(parent.ExplicitRemainingWork == "残作業は索引を更新する。", "overlapped remaining work was dropped");
-    return Task.CompletedTask;
-}
-
-Task ConfigWithoutDirectory()
+Task ConfigFile()
 {
     var name = "status-check-config-" + Guid.NewGuid().ToString("N") + ".json";
     var previous = Directory.GetCurrentDirectory();
@@ -117,8 +76,9 @@ Task ConfigWithoutDirectory()
     {
         Directory.SetCurrentDirectory(directory);
         var config = AppConfig.LoadOrCreate(name);
-        Check(File.Exists(Path.Combine(directory, name)), "config was not written");
+        var written = File.ReadAllText(Path.Combine(directory, name));
         Check(config.Model.Length > 0, "default config was empty");
+        Check(!written.Contains("facadeRunsDir", StringComparison.Ordinal), "new config still records facade logs");
     }
     finally
     {
@@ -129,355 +89,182 @@ Task ConfigWithoutDirectory()
         }
     }
 
+    var parsed = AppConfig.Parse("""
+        {
+          "stateDirectory": "state",
+          "codexSessionsDir": "codex",
+          "facadeRunsDir": "ignored",
+          "ledgerRepository": "ledger"
+        }
+        """);
+    Check(parsed.LedgerRepository == "ledger", "old config key was required");
+    Check(parsed.CodexSessionsDir == "codex", "codex directory was dropped");
     return Task.CompletedTask;
 }
 
-async Task OldMtimeInWindow()
+async Task SelectedPayload()
+{
+    await using var world = World.Create();
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("<user_instructions>\nSECRET_INSTRUCTIONS\n</user_instructions>"),
+        LogText.User("<environment_context>\nSECRET_ENVIRONMENT\n</environment_context>\nウィジェットを直して。"),
+        LogText.Assistant("SECRET_COMMENTARY 途中です", "commentary"),
+        LogText.Tool("SECRET_TOOL tool_call_update 残作業はツールだけに書く。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"),
+        LogText.User("追記の依頼は最初の依頼にしない。"));
+    await world.Run(true);
+    var thread = world.Store.GetThread("codex", "sess");
+    Check(thread?.Request?.Text == "ウィジェットを直して。", "first request was " + thread?.Request?.Text);
+    Check(thread?.Response?.Text.Contains("実装を完了した。", StringComparison.Ordinal) == true, "last answer missing");
+    Check(thread?.Response?.Basis.Contains("final_answer", StringComparison.Ordinal) == true, "basis was " + thread?.Response?.Basis);
+    Check(world.Model.Payloads.Count == 2, "call count " + world.Model.Payloads.Count);
+    var payload = string.Join("\n", world.Model.Payloads);
+    Check(payload.Contains("ウィジェットを直して。", StringComparison.Ordinal), "request was not sent");
+    Check(payload.Contains("実装を完了した。", StringComparison.Ordinal), "answer was not sent");
+    Check(!payload.Contains("SECRET_INSTRUCTIONS", StringComparison.Ordinal), "instructions were sent");
+    Check(!payload.Contains("SECRET_ENVIRONMENT", StringComparison.Ordinal), "environment was sent");
+    Check(!payload.Contains("SECRET_COMMENTARY", StringComparison.Ordinal), "commentary was sent");
+    Check(!payload.Contains("SECRET_TOOL", StringComparison.Ordinal), "tool text was sent");
+    Check(!payload.Contains("tool_call_update", StringComparison.Ordinal), "tool update was sent");
+    Check(!payload.Contains("追記の依頼", StringComparison.Ordinal), "later request replaced the first");
+    Check(world.CardText().Contains("実装を完了した。", StringComparison.Ordinal), "reported position was not written");
+    Check(world.CardText().Contains("### 文書整理", StringComparison.Ordinal), "unrelated workstream was dropped");
+
+    var calls = world.Model.Payloads.Count;
+    var responseLength = thread!.Response!.Text.Length;
+    world.AppendRollout("sess", LogText.Tool(new string('x', 20000) + " SECRET_TOOL_2 tool_call_update"));
+    await world.Run(true);
+    var again = world.Store.GetThread("codex", "sess");
+    Check(again?.Response?.Text.Length == responseLength, "mid logs changed the selected answer");
+    Check(world.Model.Payloads.Count == calls, "mid logs caused another model call");
+    Check(!string.Join("\n", world.Model.Payloads).Contains("SECRET_TOOL_2", StringComparison.Ordinal), "later tool text was sent");
+}
+
+async Task NoNormalResponse()
 {
     await using var world = World.Create();
     world.WriteCard(OneCard("なし。"));
-    world.WriteRollout("実装を開始した。");
-    var path = Directory.EnumerateFiles(world.Config.CodexSessionsDir, "rollout-*.jsonl", SearchOption.AllDirectories).Single();
-    File.SetLastWriteTimeUtc(path, new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc));
-    await world.Run(true);
-    Check(world.Store.ListByNative("codex", "sess").Any(item => item.Draft.Kind == "user_message"), "old mtime dropped an in-window event");
-}
-
-Task OversizedObservation()
-{
-    var observation = Obs("obs-long", new string('あ', 50));
-    var slices = PacketSplitter.Split([observation], 50);
-    Check(slices.Count > 1, "oversized observation stayed in one packet");
-    Check(slices.All(slice => slice.Sum(item => item.Draft.Body.Length + item.Id.Length + 32) <= 50), "a slice exceeded the packet limit");
-    Check(string.Concat(slices.SelectMany(slice => slice).Select(item => item.Draft.Body)) == observation.Draft.Body, "split dropped body text");
-    return Task.CompletedTask;
-}
-
-Task GroupingDisjoint()
-{
-    var body = "親の実装を完了した。別課題: 索引が古い。";
-    var grouped = ActivityGrouping.Group([Obs("obs1", body)], [Extracted("obs1", false, "親作業", "", "implementation_reported_complete"), Extracted("obs1", true, "独立課題", "別課題: 索引が古い。", "new_issue")]);
-    Check(grouped.Count == 2, "disjoint split was dropped");
-    Check(grouped.Single(item => item.IndependentIssue).DiscoveredFrom == grouped.Single(item => !item.IndependentIssue).Id, "discoveredFrom missing");
-    return Task.CompletedTask;
-}
-
-async Task StageSentences()
-{
-    await using var plan = World.Create();
-    plan.WriteCard(OneCard("なし。"));
-    plan.WriteRollout("実装には着手していない。計画だけを作った。");
-    await plan.Run(true);
-    Check(plan.CardText().Contains("計画のみで、実装開始は記録されていない。", StringComparison.Ordinal), "plan sentence missing");
-
-    await using var started = World.Create();
-    started.WriteCard(OneCard("なし。"));
-    started.WriteRollout("実装を開始した。");
-    await started.Run(true);
-    Check(started.CardText().Contains("実装開始が記録されている。", StringComparison.Ordinal), "start sentence missing");
-
-    await using var done = World.Create();
-    done.WriteCard(OneCard("なし。"));
-    done.WriteRollout("実装完了と報告した。");
-    await done.Run(true);
-    Check(done.CardText().Contains("実装完了と報告されている。マージ済みPRは記録されていない。", StringComparison.Ordinal), "completion sentence missing");
-}
-
-async Task ParentFacade()
-{
-    await using var world = World.Create();
-    world.WriteCard(TwoCard("https://github.com/acme/widgets/pull/8"));
-    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
-    world.Pulls.Set("acme", "widgets", 8, PullRequestState.Open);
-    var runId = "20260831T143122Z-72d77c1d";
-    world.WriteRollout("実装を開始した。 https://github.com/acme/widgets/pull/7\n別課題: 索引の不具合を見つけた。 https://github.com/acme/widgets/pull/8\n" + runId, "sess-parent");
-    world.WriteFacade(runId, "delegate the parent task");
-    await world.Run(true);
-    var activities = world.Store.ListCurrentActivities();
-    Check(activities.Count == 2, "activity count " + activities.Count);
-    Check(activities.All(item => item.NativeId == "sess-parent"), "facade run became its own activity");
-    var independent = activities.Single(item => item.DiscoveredFrom is not null);
-    Check(activities.Any(item => item.Id == independent.DiscoveredFrom), "parent link missing");
-    var facadeIds = world.Store.ListByNative("facade", runId).Select(item => item.Id).ToList();
-    Check(facadeIds.Count > 0 && facadeIds.All(id => activities.Any(item => item.ObservationIds.Contains(id, StringComparer.Ordinal))), "facade observation was not absorbed");
-}
-
-async Task OverlapHold()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
-    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
-    world.WriteRollout("同一文課題: ウィジェットの実装を完了し、索引バグを見つけた。 https://github.com/acme/widgets/pull/7");
+    var before = world.CardText();
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("実装を開始した。"),
+        LogText.Assistant("SECRET_COMMENTARY まだ答えではない", "commentary"));
     var result = await world.Run(true);
-    var activities = world.Store.ListCurrentActivities();
-    Check(activities.Count == 2, "overlap did not keep both activities");
-    Check(activities.Count(item => item.DiscoveredFrom is not null) == 1, "independent issue was folded back");
-    Check(File.ReadAllText(result.ReportPath).Contains("同じworkstreamへは重ねて書かない", StringComparison.Ordinal), "hold was not reported");
-    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "workstream was removed");
+    Check(world.CardText() == before, "a thread without a normal response changed the card");
+    Check(world.Model.Payloads.Count == 0, "a thread without a normal response called the model");
+    Check(world.Store.GetThread("codex", "sess")?.Response is null, "commentary became the response");
+    var report = File.ReadAllText(result.ReportPath);
+    Check(!report.Contains("結果未取得", StringComparison.Ordinal), "missing response was described as 結果未取得");
+    Check(report.Contains("期間内の全作業を復元したものではない", StringComparison.Ordinal), "report claimed a full reconstruction");
 }
 
-async Task RefreshMerge()
+async Task ResponseSurvivesMidLogs()
 {
     await using var world = World.Create();
-    world.WriteCard(TwoCard(null, "https://github.com/acme/widgets/pull/9"));
-    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
-    world.WriteRollout("実装完了と報告する。 https://github.com/acme/widgets/pull/7");
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。", "2026-10-15T00:11:00Z"),
+        LogText.Assistant("計画のみで、実装はしていない。", "final_answer", "2026-11-01T00:20:00Z"));
     await world.Run(true);
-    var beforeDelete = world.CardText();
-    var document = Between(beforeDelete, "### 文書整理", "");
-    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero));
-    var commits = world.Commits();
-    var second = await world.Run(true);
-    var text = world.CardText();
-    Check(!text.Contains("### ウィジェット修正", StringComparison.Ordinal), "merged workstream remained");
-    Check(text.Contains("### 文書整理", StringComparison.Ordinal), "other workstream was removed");
-    Check(text.Contains(document, StringComparison.Ordinal), "other workstream changed");
-    Check(text.Contains("管理側の受領は完了条件にしない。", StringComparison.Ordinal), "purpose changed");
-    Check(text.Contains("別件の文書整理は未着手である。", StringComparison.Ordinal), "other current sentence was dropped");
-    Check(text.Contains("対応PRはマージ済みで、明示的な残作業は記録されていない。", StringComparison.Ordinal), "completion fact missing");
-    Check(File.ReadAllText(second.ReportPath).Contains("期間外", StringComparison.Ordinal), "out-of-window merge was not labeled");
-    Check(world.Commits() == commits + 1, "delete was not committed");
-    var third = world.Commits();
-    await world.Run(true);
-    Check(world.Commits() == third, "third run added a commit");
+    var answer = world.Store.GetThread("codex", "sess")?.Response?.Text;
+    world.AppendRollout("sess", LogText.Event("task_started"), LogText.Assistant("途中の commentary", "commentary"), LogText.Tool("SECRET_MID"));
+    var result = await world.Run(true);
+    var thread = world.Store.GetThread("codex", "sess");
+    Check(thread?.Request?.Text == "ウィジェットを直して。", "the first request was dropped");
+    Check(thread?.Response?.Text == answer, "the last normal response was replaced");
+    Check(world.CardText().Contains("計画のみで、実装はしていない。", StringComparison.Ordinal), "plan response was not the current position");
+    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "a plan deleted the workstream");
+    var report = File.ReadAllText(result.ReportPath);
+    Check(!report.Contains("結果未取得", StringComparison.Ordinal), "kept response was described as 結果未取得");
+    Check(report.Contains("2026-11-01T00:20:00", StringComparison.Ordinal), "report hid the adopted response time");
+    Check(world.Model.Payloads.Any(payload => payload.Contains("ウィジェットを直して。", StringComparison.Ordinal)), "out-of-window request was dropped");
 }
 
 async Task ExplicitRemaining()
 {
     await using var world = World.Create();
-    world.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
+    world.WriteCard(TwoCard(null));
     world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
-    world.WriteRollout("実装完了と報告する。 https://github.com/acme/widgets/pull/7\n残作業は索引を更新する。");
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Tool("残作業は秘密の索引を更新する。SECRET_REMAINING"),
+        LogText.Assistant("実装を一段落させた。残作業は索引を更新する。 https://github.com/acme/widgets/pull/7", "final_answer"));
     await world.Run(true);
     var text = world.CardText();
+    Check(text.Contains("残作業は索引を更新する。", StringComparison.Ordinal), "explicit remaining work was dropped");
+    Check(text.Contains("管理側へこの残作業を戻す。", StringComparison.Ordinal), "next action was not the return to management");
     Check(text.Contains("### ウィジェット修正", StringComparison.Ordinal), "remaining work deleted the workstream");
-    Check(text.Contains("残作業は索引を更新する。", StringComparison.Ordinal), "quote missing");
-    Check(text.Contains("管理側へこの残作業を戻す。", StringComparison.Ordinal), "next action missing");
-    Check(CountOf(text, "残作業は索引を更新する。") >= 2, "quote was not kept in both fields");
+    Check(!text.Contains("SECRET_REMAINING", StringComparison.Ordinal), "tool text became remaining work");
+    Check(!string.Join("\n", world.Model.Payloads).Contains("SECRET_REMAINING", StringComparison.Ordinal), "tool remaining work was sent");
+    Check(!text.Contains("未送信の本文", StringComparison.Ordinal), "unsent body was written into the ledger");
 }
 
-async Task TailRemaining()
+async Task AlreadyMatches()
 {
     await using var world = World.Create();
-    world.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
-    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
-    world.WriteRollout(new string('あ', 4500) + "\n残作業は索引を更新する。\nhttps://github.com/acme/widgets/pull/7");
-    await world.Run(true);
-    var stored = world.Store.ListByNative("codex", "sess").Single(item => item.Draft.Kind == "user_message");
-    Check(stored.Draft.Body.Length > 4000, "stored body was truncated to the display excerpt");
-    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "tail remaining work was ignored");
-    Check(world.CardText().Contains("残作業は索引を更新する。", StringComparison.Ordinal), "tail quote missing");
-}
-
-async Task IncompleteCoverage()
-{
-    await using var world = World.Create();
-    var directory = Path.Combine(world.Ledger, "projects");
-    Directory.CreateDirectory(directory);
-    File.WriteAllText(Path.Combine(directory, "widgets.md"), TwoCard(null), World.FileEncoding);
-    var cards = CardParser.LoadRepository(world.Ledger);
-    var pull = Snapshot(7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
-    var activity = View("act-coverage", [pull], coverage: false);
-    var (changes, _) = await LedgerPlanner.PlanAsync(cards, [activity], world.Store, world.Model, CancellationToken.None);
-    Check(changes.Count == 1, "coverage case produced no update");
-    Check(changes[0].NewText.Contains("### ウィジェット修正", StringComparison.Ordinal), "workstream deleted without coverage");
-    Check(changes[0].NewText.Contains("未送信の本文があるため、明示的な残作業がないとは扱わない。", StringComparison.Ordinal), "coverage sentence missing");
-}
-
-async Task ModelFailure()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("なし。"));
-    var commits = world.Commits();
-    world.WriteRollout("FAIL_MODEL 実装を開始した。");
-    var result = await world.Run(true);
-    Check(result.ExitCode == 1, "failure exit was " + result.ExitCode);
-    Check(world.Commits() == commits, "failure committed the ledger");
-    var path = Directory.EnumerateFiles(world.Config.CodexSessionsDir, "rollout-*.jsonl", SearchOption.AllDirectories).Single();
-    var cursor = world.Store.GetCursor(path);
-    Check(cursor is not null && cursor.ByteOffset == new FileInfo(path).Length, "cursor was not left at EOF");
-    Check(world.Store.ListByNative("codex", "sess").Count > 0, "observations were dropped");
-}
-
-async Task MultiplePrRemaining()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
-    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
-    world.WriteRollout("実装完了と報告する。 https://github.com/acme/widgets/pull/7\n残作業はこの作業は複数PRが必要。");
-    await world.Run(true);
-    var text = world.CardText();
-    Check(text.Contains("### ウィジェット修正", StringComparison.Ordinal), "multiple-PR remaining work deleted the workstream");
-    Check(text.Contains("残作業はこの作業は複数PRが必要。", StringComparison.Ordinal), "multiple-PR quote missing");
-    Check(text.Contains("管理側へこの残作業を戻す。", StringComparison.Ordinal), "next action missing");
-}
-
-async Task UnmergedIdentifier()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
-    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
-    world.Pulls.Set("acme", "widgets", 8, PullRequestState.Open);
-    world.WriteRollout("実装完了と報告する。 https://github.com/acme/widgets/pull/7 https://github.com/acme/widgets/pull/8");
-    await world.Run(true);
-    var text = world.CardText();
-    Check(text.Contains("### ウィジェット修正", StringComparison.Ordinal), "unmerged identifier deleted the workstream");
-    Check(text.Contains("https://github.com/acme/widgets/pull/8 は未マージ。", StringComparison.Ordinal), "open identifier was not described");
-    Check(!text.Contains("対応PRが未特定である。", StringComparison.Ordinal), "unidentified wording was written");
-    Check(!text.Contains("必要PR", StringComparison.Ordinal), "identifiers were called required PRs");
-}
-
-async Task Unmatched()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("なし。"));
+    const string current = "計画のみで、実装はしていない。";
+    world.WriteCard(OneCard("なし。", current));
     var before = world.CardText();
-    world.WriteRollout("実装を開始した。", repositoryUrl: "https://github.com/other/repo");
-    var result = await world.Run(true);
-    Check(world.CardText() == before, "unmatched card changed");
-    var report = File.ReadAllText(result.ReportPath);
-    Check(report.Contains("決められない", StringComparison.Ordinal) || report.Contains("一致しない", StringComparison.Ordinal), "hold missing");
-    Check(world.Commits() == 1, "unmatched run committed");
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant(current, "final_answer"));
+    await world.Run(true);
+    Check(world.CardText() == before, "matching card was rewritten");
+    Check(world.Commits() == 1, "matching card was committed");
 }
 
-async Task Rerun()
+async Task RicherText()
 {
     await using var world = World.Create();
-    world.WriteCard(OneCard("なし。"));
-    world.WriteRollout("計画だけを作った。着手していない。");
-    await world.Run(false);
-    Check(world.Commits() == 1, "preview committed");
+    world.WriteCard(TwoCard(null, workstreamCurrent: "詳細な進捗: ウィジェットの実装を続けている。レビューも反映済み。"));
+    var before = world.CardText();
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("ウィジェットの実装を続けている。", "final_answer"));
     await world.Run(true);
+    Check(world.CardText() == before, "richer text was replaced");
+    Check(world.CardText().Contains("### 文書整理", StringComparison.Ordinal), "unrelated workstream changed");
+    Check(world.CardText().Contains("ウィジェットを直す。", StringComparison.Ordinal), "purpose changed");
+}
+
+async Task RefreshMerge()
+{
+    await using var world = World.Create();
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
+    await world.Run(true);
+    Check(world.Commits() == 2, "open pull did not update the card");
+    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "open pull deleted the workstream");
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero));
+    var result = await world.Run(true, window: World.Day(2));
+    var text = world.CardText();
+    Check(!text.Contains("### ウィジェット修正", StringComparison.Ordinal), "merged pull kept the workstream");
+    Check(text.Contains("### 文書整理", StringComparison.Ordinal), "other workstream was removed");
+    Check(text.Contains("ウィジェットを直す。", StringComparison.Ordinal), "purpose was removed");
+    Check(text.Contains("別件の文書整理は未着手である。", StringComparison.Ordinal), "other current sentence was removed");
+    Check(text.Contains(LedgerPlanner.CompletionFact, StringComparison.Ordinal), "completion fact missing");
+    Check(File.ReadAllText(result.ReportPath).Contains("期間外", StringComparison.Ordinal), "merge outside the window was not reported");
     var commits = world.Commits();
-    Check(commits == 2, "first apply did not commit");
-    await world.Run(true);
-    Check(world.Commits() == commits, "rerun committed again");
-    Check(world.Store.ListCurrentActivities().Count == 1, "rerun duplicated activities");
-}
-
-async Task IncompleteLine()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("なし。"));
-    var path = world.RolloutPath();
-    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-    var meta = LogText.Meta("sess", "https://github.com/acme/widgets");
-    File.WriteAllText(path, meta + "\n" + LogText.Message("実装を開始した。"), World.FileEncoding);
-    File.SetLastWriteTimeUtc(path, World.Mtime.UtcDateTime);
-    await world.Run(true);
-    Check(world.Store.ListByNative("codex", "sess").Count(item => item.Draft.Kind == "user_message") == 0, "incomplete line was consumed");
-    File.AppendAllText(path, "\n", World.FileEncoding);
-    File.SetLastWriteTimeUtc(path, World.Mtime.UtcDateTime);
-    await world.Run(true);
-    Check(world.Store.ListByNative("codex", "sess").Count(item => item.Draft.Kind == "user_message") == 1, "resumed line was duplicated or missed");
-    Check(world.Store.ListCurrentActivities().Count == 1, "resume duplicated current activities");
-    var commits = world.Commits();
-    await world.Run(true);
-    Check(world.Commits() == commits, "resume rerun committed again");
-}
-
-async Task InvalidJsonContinues()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("なし。"));
-    var rollout = world.RolloutPath();
-    Directory.CreateDirectory(Path.GetDirectoryName(rollout)!);
-    File.WriteAllText(
-        rollout,
-        LogText.Meta("sess", "https://github.com/acme/widgets") + "\n{not-json}\n" + LogText.Message("実装を開始した。") + "\n",
-        World.FileEncoding);
-    File.SetLastWriteTimeUtc(rollout, World.Mtime.UtcDateTime);
-
-    var badFacade = Path.Combine(world.Config.FacadeRunsDir, "a.events.jsonl");
-    File.WriteAllText(badFacade, "{not-json}\n", World.FileEncoding);
-    File.SetLastWriteTimeUtc(badFacade, World.Mtime.UtcDateTime);
-    var goodFacade = Path.Combine(world.Config.FacadeRunsDir, "b.events.jsonl");
-    var started = new JsonObject
-    {
-        ["ts"] = "2026-11-01T00:12:00Z",
-        ["runId"] = "b",
-        ["source"] = "facade",
-        ["type"] = "started",
-        ["data"] = new JsonObject
-        {
-            ["agent"] = "codex",
-            ["workingDirectory"] = @"D:\work",
-            ["prompt"] = "実装を開始した。",
-        },
-    };
-    File.WriteAllText(goodFacade, started.ToJsonString() + "\n", World.FileEncoding);
-    File.SetLastWriteTimeUtc(goodFacade, World.Mtime.UtcDateTime);
-
-    var first = await world.Run(false);
-    Check(first.ExitCode == 0, "invalid json stopped the run: " + first.StopReason);
-    Check(first.SkippedLogs.Count == 2, "skip count " + first.SkippedLogs.Count);
-    Check(first.SkippedLogs.Any(skip => skip.LineNumber == 2 && skip.Path == rollout), "codex line was not skipped");
-    Check(first.SkippedLogs.Any(skip => skip.LineNumber == 1 && skip.Path == badFacade), "facade line was not skipped");
-    Check(world.Store.ListByNative("codex", "sess").Count(item => item.Draft.Kind == "user_message") == 1, "valid codex line was dropped");
-    Check(world.Store.ListByNative("facade", "b").Any(item => item.Draft.Kind == "started"), "later facade file was not read");
-    var report = File.ReadAllText(first.ReportPath);
-    Check(report.Contains("2 行目", StringComparison.Ordinal), "report missed the codex line");
-    Check(report.Contains("a.events.jsonl の 1 行目", StringComparison.Ordinal), "report missed the facade line");
-
-    var second = await world.Run(false);
-    Check(second.ExitCode == 0, "second run stopped: " + second.StopReason);
-    Check(second.SkippedLogs.Count == 0, "skipped line was reported again");
-    Check(world.Store.ListByNative("codex", "sess").Count(item => item.Draft.Kind == "user_message") == 1, "second run duplicated the message");
-}
-
-async Task InvalidUtf8Chunk()
-{
-    await using var world = World.Create();
-    world.WriteCard(OneCard("なし。"));
-    var badPath = world.RolloutPath();
-    Directory.CreateDirectory(Path.GetDirectoryName(badPath)!);
-    using (var stream = File.Create(badPath))
-    {
-        stream.Write(World.FileEncoding.GetBytes(LogText.Meta("sess-bad", "https://github.com/acme/widgets") + "\n"));
-        stream.WriteByte(0xFF);
-        stream.WriteByte((byte)'\n');
-        stream.Write(World.FileEncoding.GetBytes(LogText.Message("実装を開始した。") + "\n"));
-    }
-
-    File.SetLastWriteTimeUtc(badPath, World.Mtime.UtcDateTime);
-    var later = Path.Combine(world.Config.CodexSessionsDir, "2026", "11", "01", "rollout-later.jsonl");
-    File.WriteAllText(later, LogText.Meta("sess-later", "https://github.com/acme/widgets") + "\n" + LogText.Message("実装を開始した。") + "\n", World.FileEncoding);
-    File.SetLastWriteTimeUtc(later, World.Mtime.UtcDateTime);
-
-    var first = await world.Run(false);
-    Check(first.ExitCode == 0, "invalid utf-8 stopped the run: " + first.StopReason);
-    Check(first.SkippedLogs.Count == 1 && first.SkippedLogs[0].LineNumber is null && first.SkippedLogs[0].Path == badPath, "utf-8 chunk was not reported as a file skip");
-    Check(world.Store.ListByNative("codex", "sess-bad").Count == 0, "undecodable chunk was ingested");
-    Check(world.Store.ListByNative("codex", "sess-later").Count(item => item.Draft.Kind == "user_message") == 1, "later file was not read");
-    var cursor = world.Store.GetCursor(badPath);
-    var length = new FileInfo(badPath).Length;
-    Check(cursor is not null && cursor.ByteOffset == length && cursor.NextLine == 4, "utf-8 cursor did not advance past the chunk");
-    Check(File.ReadAllText(first.ReportPath).Contains("not valid UTF-8", StringComparison.Ordinal), "report missed the utf-8 skip");
-
-    var second = await world.Run(false);
-    Check(second.ExitCode == 0, "second utf-8 run stopped: " + second.StopReason);
-    Check(second.SkippedLogs.Count == 0, "utf-8 chunk was reported again");
-    Check(world.Store.ListByNative("codex", "sess-later").Count(item => item.Draft.Kind == "user_message") == 1, "second run duplicated the later file");
-}
-
-Task OpenAiFailureMessage()
-{
-    var text = OpenAiActivityModel.FormatFailure("extract", "gpt-6.1-terra", 3, true, 429, "{\n  \"error\": { \"message\": \"Rate limit exceeded\" }\n}");
-    Check(text.Contains("after 3 attempts.", StringComparison.Ordinal), text);
-    Check(text.Contains("stage=extract", StringComparison.Ordinal), text);
-    Check(text.Contains("model=gpt-6.1-terra", StringComparison.Ordinal), text);
-    Check(text.Contains("status=429", StringComparison.Ordinal), text);
-    Check(text.Contains("Rate limit exceeded", StringComparison.Ordinal), text);
-    Check(!text.Contains('\n'), "detail kept a newline");
-    var secret = OpenAiActivityModel.FormatFailure("extract", "m", 1, false, 400, "bad sk-" + new string('a', 20));
-    Check(secret.Contains("[REDACTED]", StringComparison.Ordinal), secret);
-    Check(!secret.Contains(new string('a', 20), StringComparison.Ordinal), "secret leaked");
-    var empty = OpenAiActivityModel.FormatFailure("concentrate", "m", 1, false, 500, "  \n");
-    Check(empty.Contains("detail=(none)", StringComparison.Ordinal), empty);
-    var truncated = OpenAiActivityModel.FormatFailure("extract", "m", 1, true, 503, new string('x', 400));
-    Check(truncated.Contains("xxx...", StringComparison.Ordinal), truncated);
-    Check(!truncated.Contains(new string('x', 301), StringComparison.Ordinal), "detail was not capped");
-    return Task.CompletedTask;
+    await world.Run(true, window: World.Day(2));
+    Check(world.Commits() == commits, "completed workstream was committed again");
 }
 
 async Task ClosedUnmerged()
@@ -485,11 +272,15 @@ async Task ClosedUnmerged()
     await using var world = World.Create();
     world.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
     world.Pulls.Set("acme", "widgets", 7, PullRequestState.ClosedUnmerged);
-    world.WriteRollout("実装完了と報告する。 https://github.com/acme/widgets/pull/7");
-    await world.Run(true);
-    var text = world.CardText();
-    Check(text.Contains("未マージのClose", StringComparison.Ordinal), "closed unmerged text missing");
-    Check(text.Contains("### ウィジェット修正", StringComparison.Ordinal), "closed unmerged deleted the workstream");
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装完了と報告する。 https://github.com/acme/widgets/pull/7", "final_answer"));
+    var result = await world.Run(true);
+    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "closed unmerged deleted the workstream");
+    Check(File.ReadAllText(result.ReportPath).Contains("未マージのClose", StringComparison.Ordinal), "closed state missing from the report");
+    Check(!world.CardText().Contains("未送信の本文", StringComparison.Ordinal), "unsent body was written");
 }
 
 async Task SelfAndDevelopment()
@@ -497,19 +288,282 @@ async Task SelfAndDevelopment()
     await using var self = World.Create();
     self.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
     self.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
-    self.WriteRollout("dotnet run --file src/StatusCheck.cs\nhttps://github.com/acme/widgets/pull/7");
+    self.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("dotnet run --file src/StatusCheck.cs"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
     await self.Run(true);
-    Check(self.Store.ListCurrentActivities().All(item => item.Kind == "status_check_self"), "self kind missing");
-    Check(self.Model.ConcentratedIds.Count == 0, "self invocation was concentrated");
+    Check(self.Model.Payloads.Count == 0, "self invocation called the model");
     Check(self.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "self invocation deleted a workstream");
 
     await using var dev = World.Create();
     dev.WriteCard(OneCard("なし。"));
-    dev.WriteRollout("READMEの実装を開始した。", cwd: @"D:\Data\git\tool_coding_status_update_check", repositoryUrl: "https://github.com/suusanex/tool_coding_status_update_check");
+    var before = dev.CardText();
+    dev.WriteRollout(
+        "sess",
+        "https://github.com/suusanex/tool_coding_status_update_check",
+        LogText.User("READMEの実装を開始した。"),
+        LogText.Assistant("READMEの実装を開始した。", "final_answer"));
     await dev.Run(true);
-    var ids = dev.Store.ListCurrentActivities().Select(item => item.Id).ToList();
-    Check(ids.Count == 1 && dev.Model.ConcentratedIds.Contains(ids[0]), "tool development was excluded from concentration");
-    Check(dev.Commits() == 1, "tool development committed another project");
+    Check(dev.Model.Payloads.Any(payload => payload.Contains("READMEの実装を開始した。", StringComparison.Ordinal)), "tool development was skipped");
+    Check(dev.CardText() == before, "unrelated development changed the widgets card");
+}
+
+async Task Unmatched()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var before = world.CardText();
+    world.WriteRollout(
+        "sess",
+        "https://github.com/other/repo",
+        LogText.User("実装を開始した。"),
+        LogText.Assistant("実装を開始した。", "final_answer"));
+    var result = await world.Run(true);
+    Check(world.CardText() == before, "unmatched card changed");
+    Check(File.ReadAllText(result.ReportPath).Contains("決められない", StringComparison.Ordinal), "hold missing");
+    Check(world.Commits() == 1, "unmatched run committed");
+}
+
+async Task TwoReports()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout("sess-a", "https://github.com/acme/widgets", LogText.User("ウィジェットを直して。"), LogText.Assistant("先に調査した。", "final_answer", "2026-11-01T00:20:00Z"));
+    world.WriteRollout("sess-b", "https://github.com/acme/widgets", LogText.User("ウィジェットを直して。"), LogText.Assistant("実装を開始した。", "final_answer", "2026-11-01T00:40:00Z"));
+    var result = await world.Run(true);
+    Check(result.ExitCode == 0, result.StopReason ?? "two reports failed");
+    Check(world.CardText().Contains("実装を開始した。", StringComparison.Ordinal), "newer report was not applied");
+    Check(world.Commits() == 2, "two reports made more than one ledger commit");
+}
+
+async Task Rerun()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("計画のみで、実装はしていない。", "final_answer"));
+    await world.Run(false);
+    Check(world.Commits() == 1, "preview committed");
+    await world.Run(true);
+    var commits = world.Commits();
+    Check(commits == 2, "first apply did not commit");
+    await world.Run(true);
+    Check(world.Commits() == commits, "rerun committed again");
+}
+
+async Task ApplyProposal()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
+    var preview = await world.Run(false);
+    Check(world.Commits() == 1, "preview committed");
+    var applied = await world.Apply(preview.RunId);
+    Check(applied.ExitCode == 0, applied.StopReason ?? "apply failed");
+    Check(world.Commits() == 2, "apply did not commit");
+
+    await using var changed = World.Create();
+    changed.WriteCard(OneCard("なし。"));
+    changed.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    changed.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
+    var proposal = await changed.Run(false);
+    changed.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    try
+    {
+        await changed.Apply(proposal.RunId);
+        Check(false, "changed pull state was applied");
+    }
+    catch (StatusCheckException ex)
+    {
+        Check(ex.Message.Contains("Pull request state changed", StringComparison.Ordinal), ex.Message);
+    }
+
+    Check(changed.Commits() == 1, "rejected apply committed");
+}
+
+async Task ModelFailure()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var before = world.CardText();
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("FAIL_MODEL 実装を完了した。", "final_answer"));
+    var result = await world.Run(true);
+    Check(result.ExitCode == 1, "model failure succeeded");
+    Check(world.CardText() == before, "model failure committed the card");
+    var cursor = world.Store.GetCursor(world.RolloutPath("sess"));
+    var length = new FileInfo(world.RolloutPath("sess")).Length;
+    Check(cursor is not null && cursor.ByteOffset == length, "model failure rewound the cursor");
+}
+
+async Task IncompleteLine()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var path = world.RolloutPath("sess");
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    File.WriteAllText(path, LogText.Meta("sess", "https://github.com/acme/widgets") + "\n" + LogText.User("実装を開始した。"), World.FileEncoding);
+    File.SetLastWriteTimeUtc(path, World.Mtime.UtcDateTime);
+    await world.Run(true);
+    Check(world.Store.GetThread("codex", "sess")?.Request is null, "incomplete line was consumed");
+    File.AppendAllText(path, "\n", World.FileEncoding);
+    File.SetLastWriteTimeUtc(path, World.Mtime.UtcDateTime);
+    await world.Run(true);
+    Check(world.Store.GetThread("codex", "sess")?.Request?.Text == "実装を開始した。", "resumed line was missed");
+    Check(world.Commits() == 1, "a request without a response committed");
+    await world.Run(true);
+    Check(world.Store.GetThread("codex", "sess")?.Request?.Text == "実装を開始した。", "resumed line was duplicated");
+}
+
+async Task InvalidJsonContinues()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var path = world.RolloutPath("sess");
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    File.WriteAllText(
+        path,
+        LogText.Meta("sess", "https://github.com/acme/widgets") + "\n{not-json}\n" + LogText.User("ウィジェットを直して。") + "\n" + LogText.Assistant("実装を完了した。", "final_answer") + "\n",
+        World.FileEncoding);
+    File.SetLastWriteTimeUtc(path, World.Mtime.UtcDateTime);
+    var first = await world.Run(false);
+    Check(first.ExitCode == 0, "invalid json stopped the run: " + first.StopReason);
+    Check(first.SkippedLogs.Any(skip => skip.LineNumber == 2 && skip.Path == path), "codex line was not skipped");
+    Check(world.Store.GetThread("codex", "sess")?.Response?.Text.Contains("実装を完了した。", StringComparison.Ordinal) == true, "later answer was dropped");
+    Check(File.ReadAllText(first.ReportPath).Contains("2 行目", StringComparison.Ordinal), "report missed the bad line");
+    var second = await world.Run(false);
+    Check(second.SkippedLogs.Count == 0, "skipped line was reported again");
+    Check(world.Store.GetThread("codex", "sess")?.Request?.Text == "ウィジェットを直して。", "second run duplicated the request");
+}
+
+async Task InvalidUtf8Chunk()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var badPath = world.RolloutPath("bad");
+    Directory.CreateDirectory(Path.GetDirectoryName(badPath)!);
+    using (var stream = File.Create(badPath))
+    {
+        stream.Write(World.FileEncoding.GetBytes(LogText.Meta("sess-bad", "https://github.com/acme/widgets") + "\n"));
+        stream.WriteByte(0xFF);
+        stream.WriteByte((byte)'\n');
+        stream.Write(World.FileEncoding.GetBytes(LogText.User("実装を開始した。") + "\n"));
+    }
+
+    File.SetLastWriteTimeUtc(badPath, World.Mtime.UtcDateTime);
+    world.WriteRollout("later", "https://github.com/acme/widgets", LogText.User("実装を開始した。"), LogText.Assistant("計画のみで、実装はしていない。", "final_answer"));
+    var first = await world.Run(false);
+    Check(first.ExitCode == 0, "invalid utf-8 stopped the run: " + first.StopReason);
+    Check(first.SkippedLogs.Count == 1 && first.SkippedLogs[0].LineNumber is null && first.SkippedLogs[0].Path == badPath, "utf-8 chunk was not reported as a file skip");
+    Check(world.Store.GetThread("codex", "sess-bad") is null, "undecodable chunk was ingested");
+    Check(world.Store.GetThread("codex", "later")?.Request?.Text == "実装を開始した。", "later file was not read");
+    var cursor = world.Store.GetCursor(badPath);
+    Check(cursor is not null && cursor.ByteOffset == new FileInfo(badPath).Length && cursor.NextLine == 4, "utf-8 cursor did not advance past the chunk");
+    Check(File.ReadAllText(first.ReportPath).Contains("not valid UTF-8", StringComparison.Ordinal), "report missed the utf-8 skip");
+    var second = await world.Run(false);
+    Check(second.SkippedLogs.Count == 0, "utf-8 chunk was reported again");
+}
+
+async Task OldMtimeInWindow()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout("sess", "https://github.com/acme/widgets", LogText.User("実装を開始した。"), LogText.Assistant("計画のみで、実装はしていない。", "final_answer"));
+    var path = world.RolloutPath("sess");
+    File.SetLastWriteTimeUtc(path, new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc));
+    await world.Run(true);
+    Check(world.Store.GetThread("codex", "sess")?.Request?.Text == "実装を開始した。", "old mtime dropped an in-window event");
+}
+
+async Task OldObservation()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.Store.UpsertObservation(new ObservationDraft
+    {
+        Source = "codex",
+        NativeId = "old",
+        FilePath = "old.jsonl",
+        Ordinal = 1,
+        Timestamp = World.Mtime,
+        Kind = "user_message",
+        Body = "SENTINEL_OLD_OBSERVATION",
+        DetailJson = "{}",
+        Urls = [],
+        RunIds = [],
+    });
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("計画のみで、実装はしていない。", "final_answer"));
+    await world.Run(false);
+    Check(world.Model.Payloads.Count > 0, "new thread was not assessed");
+    Check(!string.Join("\n", world.Model.Payloads).Contains("SENTINEL_OLD_OBSERVATION", StringComparison.Ordinal), "old observation was sent");
+}
+
+async Task EstimateOnly()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Tool(new string('x', 20000) + " SECRET_ESTIMATE tool_call_update"),
+        LogText.Assistant("計画のみで、実装はしていない。", "final_answer"));
+    var result = await world.Run(false, estimate: true);
+    Check(result.ExitCode == 0, result.StopReason ?? "estimate failed");
+    Check(result.Estimated, "estimate called the live path");
+    Check(result.PlannedCalls >= 1, "estimate planned no calls");
+    Check(result.EstimatedInputTokens > 0, "estimate returned no tokens");
+    Check(world.Model.Payloads.Count == 0, "estimate called the model");
+    Check(world.Commits() == 1, "estimate committed");
+    var thread = world.Store.GetThread("codex", "sess");
+    Check(thread?.Response?.Text.Contains("SECRET_ESTIMATE", StringComparison.Ordinal) == false, "estimate kept the tool body");
+    Check((thread?.Request?.Text.Length ?? 0) + (thread?.Response?.Text.Length ?? 0) < 500, "selected text included the tool body");
+    var report = File.ReadAllText(result.ReportPath);
+    Check(report.Contains("APIは呼び出していない", StringComparison.Ordinal), "estimate report missed the dry-run notice");
+    Check(report.Contains("途中ログは送信対象に含めていない", StringComparison.Ordinal), "estimate report missed the mid-log notice");
+    Check(report.Contains("途中ログがpayloadに含まれる: いいえ", StringComparison.Ordinal), "tool update was treated as payload");
+    Check(!report.Contains("SECRET_ESTIMATE", StringComparison.Ordinal), "estimate report included the tool body");
+}
+
+Task OpenAiFailureMessage()
+{
+    var text = OpenAiActivityModel.FormatFailure("assess", "gpt-6.1-terra", 3, true, 429, "{\n  \"error\": { \"message\": \"Rate limit exceeded\" }\n}");
+    Check(text.Contains("after 3 attempts.", StringComparison.Ordinal), text);
+    Check(text.Contains("stage=assess", StringComparison.Ordinal), text);
+    Check(text.Contains("model=gpt-6.1-terra", StringComparison.Ordinal), text);
+    Check(text.Contains("status=429", StringComparison.Ordinal), text);
+    Check(text.Contains("Rate limit exceeded", StringComparison.Ordinal), text);
+    Check(!text.Contains('\n'), "detail kept a newline");
+    var secret = OpenAiActivityModel.FormatFailure("assess", "m", 1, false, 400, "bad sk-" + new string('a', 20));
+    Check(secret.Contains("[REDACTED]", StringComparison.Ordinal), secret);
+    Check(!secret.Contains(new string('a', 20), StringComparison.Ordinal), "secret leaked");
+    var empty = OpenAiActivityModel.FormatFailure("reconcile", "m", 1, false, 500, "  \n");
+    Check(empty.Contains("detail=(none)", StringComparison.Ordinal), empty);
+    var truncated = OpenAiActivityModel.FormatFailure("assess", "m", 1, true, 503, new string('x', 400));
+    Check(truncated.Contains("xxx...", StringComparison.Ordinal), truncated);
+    Check(!truncated.Contains(new string('x', 301), StringComparison.Ordinal), "detail was not capped");
+    return Task.CompletedTask;
 }
 
 static void Check(bool condition, string message)
@@ -520,98 +574,10 @@ static void Check(bool condition, string message)
     }
 }
 
-static int CountOf(string text, string value)
+static string OneCard(string reference, string? current = null)
 {
-    var count = 0;
-    var index = 0;
-    while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
-    {
-        count++;
-        index += value.Length;
-    }
-
-    return count;
-}
-
-static string Between(string text, string start, string end)
-{
-    var from = text.IndexOf(start, StringComparison.Ordinal);
-    if (from < 0)
-    {
-        throw new InvalidOperationException("marker missing: " + start);
-    }
-
-    var to = string.IsNullOrEmpty(end) ? text.Length : text.IndexOf(end, from + start.Length, StringComparison.Ordinal);
-    if (to < 0)
-    {
-        to = text.Length;
-    }
-
-    return text[from..to];
-}
-
-static StoredObservation Obs(string id, string body) => new()
-{
-    Id = id,
-    Draft = new ObservationDraft
-    {
-        Source = "codex",
-        NativeId = "sess",
-        FilePath = "rollout.jsonl",
-        Ordinal = 1,
-        Kind = "user_message",
-        Body = body,
-        DetailJson = "{}",
-        Urls = Normalize.GitHubRefs(body),
-        RunIds = [],
-    },
-};
-
-static ExtractedActivity Extracted(string id, bool independent, string summary, string quote, string stage, string remaining = "") => new()
-{
-    ObservationIds = [id],
-    IndependentIssue = independent,
-    Summary = summary,
-    Purpose = "",
-    Stages = [stage],
-    PeriodChange = "",
-    CurrentPosition = "",
-    ExplicitRemainingWork = remaining,
-    Uncertainty = "",
-    Confidence = 1,
-    NextAction = "",
-    UncertainMerge = false,
-    EvidenceQuotes = quote.Length == 0 ? [] : [new EvidenceQuote(id, quote)],
-};
-
-static PullRequestSnapshot Snapshot(int number, PullRequestState state, DateTimeOffset? mergedAt)
-{
-    var url = "https://github.com/acme/widgets/pull/" + number.ToString(System.Globalization.CultureInfo.InvariantCulture);
-    return new PullRequestSnapshot(url, "acme", "widgets", number, state, mergedAt, null, "title");
-}
-
-static ActivityView View(string id, IReadOnlyList<PullRequestSnapshot> pulls, bool coverage) => new()
-{
-    Id = id,
-    Summary = "実装完了",
-    Purpose = "",
-    Repository = "acme/widgets",
-    Stages = [StageNames.ImplementationReportedComplete],
-    PeriodChange = "",
-    CurrentPosition = "",
-    Kind = "normal",
-    InWindow = true,
-    Evidence = [],
-    Uncertainty = "",
-    PullRequests = pulls,
-    IssueRefs = [],
-    ExplicitRemainingWork = null,
-    NextAction = "",
-    ObservationIds = ["obs"],
-    CoverageComplete = coverage,
-};
-
-static string OneCard(string reference) => """
+    var body = current ?? "ウィジェットの実装を続けている。";
+    return """
 ---
 status: active
 repositories:
@@ -626,7 +592,7 @@ repositories:
 
 ## 現在地
 
-ウィジェットの実装を続けている。
+""" + body + """
 
 ## 識別キーワード
 
@@ -638,7 +604,7 @@ widgets
 
 **現在地**
 
-ウィジェットの実装を続けている。
+""" + body + """
 
 **次のアクション**
 
@@ -651,11 +617,13 @@ widgets
 **参照**
 
 """ + reference + "\n";
+}
 
-static string TwoCard(string? secondReference, string? extraFirstReference = null)
+static string TwoCard(string? secondReference, string? workstreamCurrent = null)
 {
-    var first = "https://github.com/acme/widgets/pull/7" + (extraFirstReference is null ? "" : "\n" + extraFirstReference);
+    var first = "https://github.com/acme/widgets/pull/7";
     var second = secondReference ?? "なし。";
+    var current = workstreamCurrent ?? "ウィジェットの実装を続けている。";
     return """
 ---
 status: active
@@ -683,7 +651,7 @@ widgets
 
 **現在地**
 
-ウィジェットの実装を続けている。
+""" + current + """
 
 **次のアクション**
 
@@ -739,23 +707,63 @@ internal static class LogText
         return line.ToJsonString();
     }
 
-    internal static string Message(string text)
+    internal static string User(string text, string timestamp = "2026-11-01T00:11:00Z") =>
+        Message("user", text, "", timestamp);
+
+    internal static string Assistant(string text, string phase, string timestamp = "2026-11-01T00:20:00Z") =>
+        Message("assistant", text, phase, timestamp);
+
+    internal static string Tool(string secret)
     {
-        var line = new JsonObject
+        var arguments = new JsonObject
         {
-            ["timestamp"] = "2026-11-01T00:11:00Z",
+            ["prompt"] = secret,
+            ["output"] = secret,
+        };
+        return new JsonObject
+        {
+            ["timestamp"] = "2026-11-01T00:15:00Z",
             ["type"] = "response_item",
             ["payload"] = new JsonObject
             {
-                ["type"] = "message",
-                ["role"] = "user",
-                ["content"] = new JsonArray
-                {
-                    new JsonObject { ["type"] = "input_text", ["text"] = text },
-                },
+                ["type"] = "function_call",
+                ["name"] = "start_agent",
+                ["call_id"] = "call-1",
+                ["arguments"] = arguments.ToJsonString(),
+            },
+        }.ToJsonString();
+    }
+
+    internal static string Event(string type) =>
+        new JsonObject
+        {
+            ["timestamp"] = "2026-11-01T00:30:00Z",
+            ["type"] = "event_msg",
+            ["payload"] = new JsonObject { ["type"] = type },
+        }.ToJsonString();
+
+    private static string Message(string role, string text, string phase, string timestamp)
+    {
+        var payload = new JsonObject
+        {
+            ["type"] = "message",
+            ["role"] = role,
+            ["content"] = new JsonArray
+            {
+                new JsonObject { ["type"] = role == "user" ? "input_text" : "output_text", ["text"] = text },
             },
         };
-        return line.ToJsonString();
+        if (phase.Length > 0)
+        {
+            payload["phase"] = phase;
+        }
+
+        return new JsonObject
+        {
+            ["timestamp"] = timestamp,
+            ["type"] = "response_item",
+            ["payload"] = payload,
+        }.ToJsonString();
     }
 }
 
@@ -764,7 +772,7 @@ internal sealed class World : IAsyncDisposable
     internal static readonly Encoding FileEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
     private static readonly Encoding Utf8 = FileEncoding;
     internal static readonly DateTimeOffset Mtime = new(2026, 11, 1, 3, 0, 0, TimeSpan.Zero);
-    private static readonly TimeWindow Window = TimeWindow.FromDates(new DateOnly(2026, 11, 1), new DateOnly(2026, 11, 1), TimeZoneInfo.Utc);
+    private static readonly TimeWindow Window = Day(1);
     private static readonly DateTimeOffset Now = new(2026, 11, 1, 12, 0, 0, TimeSpan.Zero);
 
     internal required string Root { get; init; }
@@ -774,6 +782,9 @@ internal sealed class World : IAsyncDisposable
     internal required FakePulls Pulls { get; init; }
     internal string Ledger => Config.LedgerRepository;
 
+    internal static TimeWindow Day(int day) =>
+        TimeWindow.FromDates(new DateOnly(2026, 11, day), new DateOnly(2026, 11, day), TimeZoneInfo.Utc);
+
     internal static World Create()
     {
         var root = Path.Combine(Path.GetTempPath(), "status-check-" + Guid.NewGuid().ToString("N"));
@@ -782,7 +793,6 @@ internal sealed class World : IAsyncDisposable
             StateDirectory = Path.Combine(root, "state"),
             CodexSessionsDir = Path.Combine(root, "sessions"),
             CodexArchivedSessionsDir = null,
-            FacadeRunsDir = Path.Combine(root, "facade"),
             LedgerRepository = Path.Combine(root, "ledger"),
             Model = "scripted",
             ReasoningEffort = "medium",
@@ -791,7 +801,6 @@ internal sealed class World : IAsyncDisposable
         };
         Directory.CreateDirectory(Path.Combine(config.LedgerRepository, "projects"));
         Directory.CreateDirectory(config.CodexSessionsDir);
-        Directory.CreateDirectory(config.FacadeRunsDir);
         LedgerGit.Run(config.LedgerRepository, ["init", "-b", "main"]);
         LedgerGit.Run(config.LedgerRepository, ["config", "user.email", "status-check@example.com"]);
         LedgerGit.Run(config.LedgerRepository, ["config", "user.name", "status-check"]);
@@ -832,47 +841,39 @@ internal sealed class World : IAsyncDisposable
         }
     }
 
-    internal string RolloutPath() => Path.Combine(Config.CodexSessionsDir, "2026", "11", "01", "rollout-test.jsonl");
+    internal string RolloutPath(string session) =>
+        Path.Combine(Config.CodexSessionsDir, "2026", "11", "01", "rollout-" + session + ".jsonl");
 
-    internal void WriteRollout(string message, string session = "sess", string cwd = @"D:\work", string repositoryUrl = "https://github.com/acme/widgets")
+    internal void WriteRollout(string session, string repositoryUrl, params string[] lines)
     {
-        var path = RolloutPath();
+        var path = RolloutPath(session);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, LogText.Meta(session, repositoryUrl, cwd) + "\n" + LogText.Message(message) + "\n", Utf8);
+        File.WriteAllText(path, string.Join("\n", lines.Prepend(LogText.Meta(session, repositoryUrl))) + "\n", Utf8);
         File.SetLastWriteTimeUtc(path, Mtime.UtcDateTime);
     }
 
-    internal void WriteFacade(string runId, string prompt)
+    internal void AppendRollout(string session, params string[] lines)
     {
-        var line = new JsonObject
-        {
-            ["ts"] = "2026-11-01T00:12:00Z",
-            ["runId"] = runId,
-            ["source"] = "facade",
-            ["type"] = "started",
-            ["data"] = new JsonObject
-            {
-                ["agent"] = "codex",
-                ["workingDirectory"] = @"D:\work",
-                ["prompt"] = prompt,
-            },
-        };
-        var path = Path.Combine(Config.FacadeRunsDir, runId + ".events.jsonl");
-        File.WriteAllText(path, line.ToJsonString() + "\n", Utf8);
+        var path = RolloutPath(session);
+        File.AppendAllText(path, string.Join("\n", lines) + "\n", Utf8);
         File.SetLastWriteTimeUtc(path, Mtime.UtcDateTime);
     }
 
-    internal Task<RunResult> Run(bool apply) =>
+    internal Task<RunResult> Run(bool apply, bool estimate = false, TimeWindow? window = null) =>
         StatusPipeline.RunAsync(new RunRequest
         {
             Config = Config,
-            Window = Window,
-            ApplyLedger = apply,
+            Window = window ?? Window,
+            ApplyLedger = apply && !estimate,
+            EstimateOnly = estimate,
             Model = Model,
             Pulls = Pulls,
             Store = Store,
             Now = Now,
         }, CancellationToken.None);
+
+    internal Task<RunResult> Apply(string runId) =>
+        StatusPipeline.ApplyAsync(Config, Store, runId, Pulls, CancellationToken.None);
 
     public async ValueTask DisposeAsync()
     {
@@ -901,107 +902,114 @@ internal sealed class World : IAsyncDisposable
 
 internal sealed class ScriptedModel : IActivityModel
 {
-    internal List<string> ConcentratedIds { get; } = [];
+    internal List<string> Payloads { get; } = [];
 
-    public Task<IReadOnlyList<ExtractedActivity>> ExtractAsync(ActivityPacket packet, CancellationToken cancellationToken)
+    public Task<ThreadAssessment> AssessAsync(string system, string user, CancellationToken cancellationToken)
     {
-        var extracted = new List<ExtractedActivity>();
-        foreach (var observation in packet.Observations)
+        Payloads.Add(system + "\n" + user);
+        if (user.Contains("FAIL_MODEL", StringComparison.Ordinal))
         {
-            var body = observation.Draft.Body;
-            if (body.Contains("FAIL_MODEL", StringComparison.Ordinal))
-            {
-                throw new StatusCheckException("scripted model failure");
-            }
-
-            if (body.Contains("同一文課題:", StringComparison.Ordinal))
-            {
-                extracted.Add(Make(observation.Id, false, "親作業", StagesFor(body), "", []));
-                extracted.Add(Make(observation.Id, true, "独立課題", ["new_issue"], "", [new EvidenceQuote(observation.Id, body.Trim())]));
-                continue;
-            }
-
-            if (body.Contains("別課題:", StringComparison.Ordinal))
-            {
-                var index = body.IndexOf("別課題:", StringComparison.Ordinal);
-                var parentQuote = body[..index].Trim();
-                var childQuote = body[index..].Trim();
-                extracted.Add(Make(observation.Id, false, "親作業", StagesFor(parentQuote), "", [new EvidenceQuote(observation.Id, parentQuote)]));
-                extracted.Add(Make(observation.Id, true, "独立課題", ["new_issue"], "", [new EvidenceQuote(observation.Id, childQuote)]));
-                continue;
-            }
-
-            var remaining = Normalize.SplitSentences(body).FirstOrDefault(sentence => sentence.Contains("残作業", StringComparison.Ordinal)) ?? "";
-            extracted.Add(Make(observation.Id, false, SummaryFor(body), StagesFor(body), remaining, []));
+            throw new StatusCheckException("scripted model failure");
         }
 
-        return Task.FromResult<IReadOnlyList<ExtractedActivity>>(extracted);
+        var response = Section(user, "response");
+        return Task.FromResult(new ThreadAssessment
+        {
+            Summary = response.Length == 0 ? "依頼" : response,
+            Purpose = "",
+            CurrentPosition = response,
+            ExplicitRemainingWork = Remaining(response),
+            NextAction = "",
+            Uncertainty = "",
+            SelectedPullUrls = Urls(response),
+        });
     }
 
-    public Task<WorkstreamChoice> ChooseWorkstreamAsync(WorkstreamChoiceRequest request, CancellationToken cancellationToken) =>
-        Task.FromResult(new WorkstreamChoice(null, true));
-
-    public Task<IReadOnlyList<ConcentrationItem>> ConcentrateAsync(IReadOnlyList<ActivityView> activities, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<LedgerFieldUpdate>> ReconcileAsync(string system, string user, CancellationToken cancellationToken)
     {
-        ConcentratedIds.AddRange(activities.Select(activity => activity.Id));
-        return Task.FromResult<IReadOnlyList<ConcentrationItem>>([]);
+        Payloads.Add(system + "\n" + user);
+        if (!user.Contains("### ウィジェット修正", StringComparison.Ordinal))
+        {
+            return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([]);
+        }
+
+        var response = Section(user, "response");
+        if (response.Contains("残作業", StringComparison.Ordinal) || !AllMerged(user) || (!response.Contains("実装完了", StringComparison.Ordinal) && !response.Contains("完了した", StringComparison.Ordinal)))
+        {
+            return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([new LedgerFieldUpdate("ウィジェット修正", "update", response, "", "", "")]);
+        }
+
+        return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([new LedgerFieldUpdate("ウィジェット修正", "delete", "", "", "", "")]);
     }
 
-    private static ExtractedActivity Make(string id, bool independent, string summary, IReadOnlyList<string> stages, string remaining, IReadOnlyList<EvidenceQuote> quotes) => new()
+    private static string Section(string user, string label)
     {
-        ObservationIds = [id],
-        IndependentIssue = independent,
-        Summary = summary,
-        Purpose = "",
-        Stages = stages,
-        PeriodChange = summary,
-        CurrentPosition = "",
-        ExplicitRemainingWork = remaining,
-        Uncertainty = "",
-        Confidence = 1,
-        NextAction = "",
-        UncertainMerge = false,
-        EvidenceQuotes = quotes,
-    };
-
-    private static IReadOnlyList<string> StagesFor(string text)
-    {
-        if (text.Contains("実装完了", StringComparison.Ordinal))
+        // StringBuilder.AppendLine は Windows では CRLF を出す。マーカーは LF で探す。
+        var normalized = user.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        var marker = label + ":\n";
+        var start = normalized.LastIndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
         {
-            return ["implementation_reported_complete"];
+            return "";
         }
 
-        if (text.Contains("実装を開始", StringComparison.Ordinal))
+        start += marker.Length;
+        var end = normalized.Length;
+        foreach (var stop in new[] { "\npulls:", "\npullCandidates:", "\n---", "\nrequestAt:", "\nresponseAt:" })
         {
-            return ["implementation_started"];
+            var found = normalized.IndexOf(stop, start, StringComparison.Ordinal);
+            if (found >= 0 && found < end)
+            {
+                end = found;
+            }
         }
 
-        if (text.Contains("計画だけ", StringComparison.Ordinal) || text.Contains("計画のみ", StringComparison.Ordinal))
-        {
-            return ["plan_only"];
-        }
-
-        return ["consultation"];
+        return normalized[start..end].Trim();
     }
 
-    private static string SummaryFor(string text)
+    private static string Remaining(string response)
     {
-        if (text.Contains("実装完了", StringComparison.Ordinal))
+        foreach (var sentence in response.Split('。', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            return "実装完了の報告";
+            if (sentence.Contains("残作業", StringComparison.Ordinal))
+            {
+                return sentence + "。";
+            }
         }
 
-        if (text.Contains("実装を開始", StringComparison.Ordinal))
+        return "";
+    }
+
+    private static bool AllMerged(string user)
+    {
+        var normalized = user.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        var pulls = normalized.Split('\n').Where(line => line.StartsWith("- https://", StringComparison.Ordinal)).ToList();
+        return pulls.Count > 0 && pulls.All(line => line.TrimEnd().EndsWith("Merged", StringComparison.Ordinal));
+    }
+
+    private static List<string> Urls(string text)
+    {
+        var found = new List<string>();
+        var index = 0;
+        const string marker = "https://github.com/";
+        while ((index = text.IndexOf(marker, index, StringComparison.Ordinal)) >= 0)
         {
-            return "実装開始";
+            var end = index;
+            while (end < text.Length && !char.IsWhiteSpace(text[end]))
+            {
+                end++;
+            }
+
+            var url = text[index..end].TrimEnd('.', ')', ']', ',');
+            if (!found.Contains(url, StringComparer.Ordinal))
+            {
+                found.Add(url);
+            }
+
+            index = end;
         }
 
-        if (text.Contains("計画だけ", StringComparison.Ordinal) || text.Contains("計画のみ", StringComparison.Ordinal))
-        {
-            return "計画のみ";
-        }
-
-        return "相談";
+        return found;
     }
 }
 

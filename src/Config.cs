@@ -10,7 +10,6 @@ internal sealed class AppConfig
     public required string StateDirectory { get; init; }
     public required string CodexSessionsDir { get; init; }
     public string? CodexArchivedSessionsDir { get; init; }
-    public required string FacadeRunsDir { get; init; }
     public required string LedgerRepository { get; init; }
     public required string Model { get; init; }
     public required string ReasoningEffort { get; init; }
@@ -51,7 +50,6 @@ internal sealed class AppConfig
                 ["stateDirectory"] = created.StateDirectory,
                 ["codexSessionsDir"] = created.CodexSessionsDir,
                 ["codexArchivedSessionsDir"] = created.CodexArchivedSessionsDir,
-                ["facadeRunsDir"] = created.FacadeRunsDir,
                 ["ledgerRepository"] = created.LedgerRepository,
                 ["model"] = created.Model,
                 ["reasoningEffort"] = created.ReasoningEffort,
@@ -74,7 +72,6 @@ internal sealed class AppConfig
             StateDirectory = Path.Combine(profile, ".coding-status-check"),
             CodexSessionsDir = Path.Combine(profile, ".codex", "sessions"),
             CodexArchivedSessionsDir = Directory.Exists(archived) ? archived : null,
-            FacadeRunsDir = ResolveFacadeDirectory(Environment.GetEnvironmentVariable, profile),
             LedgerRepository = @"D:\Data\git\personal-project-driver",
             Model = "gpt-6.1-terra",
             ReasoningEffort = "medium",
@@ -83,23 +80,11 @@ internal sealed class AppConfig
         };
     }
 
-    public static string ResolveFacadeDirectory(Func<string, string?> environment, string userProfile)
-    {
-        var configured = environment("CODEX_AGENT_FACADE_LOG_DIR");
-        if (!string.IsNullOrWhiteSpace(configured))
-        {
-            return Environment.ExpandEnvironmentVariables(configured.Trim());
-        }
-
-        return Path.Combine(userProfile, ".codex-agent-facade", "runs");
-    }
-
     public static AppConfig Parse(string json)
     {
         var obj = JsonNode.Parse(json) as JsonObject ?? throw new StatusCheckException("Config JSON is not an object.");
         var state = Required(obj, "stateDirectory");
         var codex = Required(obj, "codexSessionsDir");
-        var facade = Required(obj, "facadeRunsDir");
         var ledger = Required(obj, "ledgerRepository");
         var model = obj["model"]?.GetValue<string>();
         var effort = obj["reasoningEffort"]?.GetValue<string>();
@@ -121,7 +106,6 @@ internal sealed class AppConfig
             StateDirectory = state,
             CodexSessionsDir = codex,
             CodexArchivedSessionsDir = string.IsNullOrWhiteSpace(archived) ? null : archived,
-            FacadeRunsDir = facade,
             LedgerRepository = ledger,
             Model = string.IsNullOrWhiteSpace(model) ? "gpt-6.1-terra" : model,
             ReasoningEffort = string.IsNullOrWhiteSpace(effort) ? "medium" : effort,
