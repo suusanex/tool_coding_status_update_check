@@ -58,13 +58,13 @@ internal static class ActivityGrouping
                 notes.Add("モデルが親活動を返さなかった。");
             }
 
-            primary = Build(primaryItems.Concat(rejectedItems).ToList(), primarySpans, false, null, notes);
+            primary = Build(primaryItems.Concat(rejectedItems).ToList(), primarySpans, false, null, notes, bodies);
             grouped.Add(primary);
         }
 
         foreach (var pair in accepted)
         {
-            grouped.Add(Build([pair.Item], pair.Spans, pair.Item.IndependentIssue, primary?.Id, []));
+            grouped.Add(Build([pair.Item], pair.Spans, pair.Item.IndependentIssue, primary?.Id, [], bodies));
         }
 
         var distinct = new List<GroupedActivity>();
@@ -80,10 +80,20 @@ internal static class ActivityGrouping
         return distinct;
     }
 
-    private static GroupedActivity Build(IReadOnlyList<ExtractedActivity> items, IReadOnlyList<EvidenceSpan> spans, bool independent, string? discoveredFrom, IReadOnlyList<string> notes)
+    private static GroupedActivity Build(
+        IReadOnlyList<ExtractedActivity> items,
+        IReadOnlyList<EvidenceSpan> spans,
+        bool independent,
+        string? discoveredFrom,
+        IReadOnlyList<string> notes,
+        IReadOnlyDictionary<string, string> observationBodies)
     {
         var quoteText = string.Join('\n', spans.Select(span => span.Quote));
-        var bodies = spans.Select(span => span.Quote).ToList();
+        var confirmationSources = independent
+            ? spans.Select(span => span.Quote)
+            : items.SelectMany(item => item.ObservationIds).Distinct(StringComparer.Ordinal)
+                .Where(observationBodies.ContainsKey)
+                .Select(id => observationBodies[id]);
         string? remaining = null;
         var stages = new List<string>();
         var summaries = new List<string>();
@@ -95,7 +105,7 @@ internal static class ActivityGrouping
         var confidence = 0d;
         foreach (var item in items)
         {
-            remaining ??= Normalize.ConfirmQuote(item.ExplicitRemainingWork, bodies);
+            remaining ??= Normalize.ConfirmQuote(item.ExplicitRemainingWork, confirmationSources);
             foreach (var stage in item.Stages)
             {
                 if (StageNames.Reported.Contains(stage) && !stages.Contains(stage, StringComparer.Ordinal))

@@ -41,7 +41,11 @@ internal sealed class AppConfig
         if (!File.Exists(path))
         {
             var created = CreateDefault();
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var directory = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
             var json = new JsonObject
             {
                 ["stateDirectory"] = created.StateDirectory,

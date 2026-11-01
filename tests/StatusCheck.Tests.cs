@@ -22,6 +22,10 @@ var failures = new List<string>();
 await Case("grouping keeps overlapping independent issue", GroupingOverlap);
 await Case("grouping rejects an unconfirmed quote", GroupingUnconfirmed);
 await Case("grouping keeps disjoint quotes", GroupingDisjoint);
+await Case("overlapped remaining work stays on the parent", GroupingKeepsOverlappedRemainingWork);
+await Case("a config file name without a directory can be created", ConfigWithoutDirectory);
+await Case("an old file mtime does not drop in-window events", OldMtimeInWindow);
+await Case("an oversized observation is split under the packet limit", OversizedObservation);
 await Case("plan, start, and reported completion stay distinct", StageSentences);
 await Case("parent and facade stay one activity and keep an independent issue", ParentFacade);
 await Case("overlapping quote does not write the independent issue twice", OverlapHold);
@@ -81,6 +85,66 @@ Task GroupingUnconfirmed()
     var grouped = ActivityGrouping.Group([Obs("obs1", body)], [Extracted("obs1", false, "親作業", "", "implementation_reported_complete"), Extracted("obs1", true, "独立課題", "本文に存在しない引用", "new_issue")]);
     Check(grouped.Count == 1, "unconfirmed split was kept");
     Check(grouped[0].Uncertainty.Contains("確認できない", StringComparison.Ordinal), "missing uncertainty");
+    return Task.CompletedTask;
+}
+
+Task GroupingKeepsOverlappedRemainingWork()
+{
+    var body = "実装完了と報告する。残作業は索引を更新する。続きがある。";
+    var grouped = ActivityGrouping.Group(
+        [Obs("obs1", body)],
+        [
+            Extracted("obs1", false, "親作業", "", "implementation_reported_complete", "残作業は索引を更新する。"),
+            Extracted("obs1", true, "独立課題", "残作業は索引を更新する。", "new_issue"),
+        ]);
+    var parent = grouped.Single(item => !item.IndependentIssue);
+    Check(parent.ExplicitRemainingWork == "残作業は索引を更新する。", "overlapped remaining work was dropped");
+    return Task.CompletedTask;
+}
+
+Task ConfigWithoutDirectory()
+{
+    var name = "status-check-config-" + Guid.NewGuid().ToString("N") + ".json";
+    var previous = Directory.GetCurrentDirectory();
+    var directory = Path.Combine(Path.GetTempPath(), "status-check-config-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    try
+    {
+        Directory.SetCurrentDirectory(directory);
+        var config = AppConfig.LoadOrCreate(name);
+        Check(File.Exists(Path.Combine(directory, name)), "config was not written");
+        Check(config.Model.Length > 0, "default config was empty");
+    }
+    finally
+    {
+        Directory.SetCurrentDirectory(previous);
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    return Task.CompletedTask;
+}
+
+async Task OldMtimeInWindow()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout("実装を開始した。");
+    var path = Directory.EnumerateFiles(world.Config.CodexSessionsDir, "rollout-*.jsonl", SearchOption.AllDirectories).Single();
+    File.SetLastWriteTimeUtc(path, new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc));
+    await world.Run(true);
+    Check(world.Store.ListByNative("codex", "sess").Any(item => item.Draft.Kind == "user_message"), "old mtime dropped an in-window event");
+}
+
+Task OversizedObservation()
+{
+    var observation = Obs("obs-long", new string('あ', 50));
+    var slices = PacketSplitter.Split([observation], 50);
+    Check(slices.Count > 1, "oversized observation stayed in one packet");
+    Check(slices.All(slice => slice.Sum(item => item.Draft.Body.Length + item.Id.Length + 32) <= 50), "a slice exceeded the packet limit");
+    Check(string.Concat(slices.SelectMany(slice => slice).Select(item => item.Draft.Body)) == observation.Draft.Body, "split dropped body text");
     return Task.CompletedTask;
 }
 
@@ -394,7 +458,7 @@ static StoredObservation Obs(string id, string body) => new()
     },
 };
 
-static ExtractedActivity Extracted(string id, bool independent, string summary, string quote, string stage) => new()
+static ExtractedActivity Extracted(string id, bool independent, string summary, string quote, string stage, string remaining = "") => new()
 {
     ObservationIds = [id],
     IndependentIssue = independent,
@@ -403,7 +467,7 @@ static ExtractedActivity Extracted(string id, bool independent, string summary, 
     Stages = [stage],
     PeriodChange = "",
     CurrentPosition = "",
-    ExplicitRemainingWork = "",
+    ExplicitRemainingWork = remaining,
     Uncertainty = "",
     Confidence = 1,
     NextAction = "",
