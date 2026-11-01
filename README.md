@@ -29,6 +29,8 @@ dotnet run --file src/StatusCheck.cs -- apply --proposal <runId>
 
 人間向けの Facade `.log`、`auth.json`、暗号化された reasoning は読まない。
 
+JSON として読めない完結した行と、UTF-8 として読めないチャンクはレポートに残して読み飛ばす。実行は止めない。末尾に改行が無い行は、追記が終わるまで読まない。
+
 ## 台帳で workstream を消す条件
 
 活動の根拠から取り出した pull がすべてマージ済みで、保存済み本文から確認できた明示的な残作業がなく、本文をモデルへ送り切っているときだけ、その workstream の block を削除する。Project カード自体は消さない。管理側への返却や受領は待たない。

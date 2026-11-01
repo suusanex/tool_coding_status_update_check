@@ -15,6 +15,21 @@ internal static class ReportWriter
         builder.AppendLine("- 収集対象: Codex rollout と CodexAgentFacade の events.jsonl");
         builder.AppendLine("- ChatGPT Chat の履歴は収集していない。");
         builder.AppendLine();
+        builder.AppendLine("## 読めなかったログ");
+        builder.AppendLine();
+        if (model.SkippedLogs.Count == 0)
+        {
+            builder.AppendLine("なし。");
+        }
+        else
+        {
+            foreach (var skip in model.SkippedLogs)
+            {
+                builder.AppendLine("- " + skip.ToReport());
+            }
+        }
+
+        builder.AppendLine();
         builder.AppendLine("## 活動");
         builder.AppendLine();
         foreach (var activity in model.Activities.Where(activity => activity.Kind != "status_check_self"))
@@ -146,4 +161,5 @@ internal sealed class ReportModel
     public required int InputTokens { get; init; }
     public required int OutputTokens { get; init; }
     public required decimal EstimatedUsd { get; init; }
+    public IReadOnlyList<IngestSkip> SkippedLogs { get; init; } = [];
 }

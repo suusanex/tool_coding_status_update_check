@@ -39,6 +39,8 @@ await Case("an unmerged pull identifier blocks completion", UnmergedIdentifier);
 await Case("unmatched repository does not change the card", Unmatched);
 await Case("rerun does not add another commit", Rerun);
 await Case("an incomplete line is resumed once", IncompleteLine);
+await Case("invalid json does not stop the run", InvalidJsonContinues);
+await Case("invalid utf-8 chunk is skipped", InvalidUtf8Chunk);
 await Case("closed unmerged is not merged", ClosedUnmerged);
 await Case("self invocation is excluded and tool development is kept", SelfAndDevelopment);
 
@@ -369,6 +371,90 @@ async Task IncompleteLine()
     var commits = world.Commits();
     await world.Run(true);
     Check(world.Commits() == commits, "resume rerun committed again");
+}
+
+async Task InvalidJsonContinues()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var rollout = world.RolloutPath();
+    Directory.CreateDirectory(Path.GetDirectoryName(rollout)!);
+    File.WriteAllText(
+        rollout,
+        LogText.Meta("sess", "https://github.com/acme/widgets") + "\n{not-json}\n" + LogText.Message("実装を開始した。") + "\n",
+        World.FileEncoding);
+    File.SetLastWriteTimeUtc(rollout, World.Mtime.UtcDateTime);
+
+    var badFacade = Path.Combine(world.Config.FacadeRunsDir, "a.events.jsonl");
+    File.WriteAllText(badFacade, "{not-json}\n", World.FileEncoding);
+    File.SetLastWriteTimeUtc(badFacade, World.Mtime.UtcDateTime);
+    var goodFacade = Path.Combine(world.Config.FacadeRunsDir, "b.events.jsonl");
+    var started = new JsonObject
+    {
+        ["ts"] = "2026-11-01T00:12:00Z",
+        ["runId"] = "b",
+        ["source"] = "facade",
+        ["type"] = "started",
+        ["data"] = new JsonObject
+        {
+            ["agent"] = "codex",
+            ["workingDirectory"] = @"D:\work",
+            ["prompt"] = "実装を開始した。",
+        },
+    };
+    File.WriteAllText(goodFacade, started.ToJsonString() + "\n", World.FileEncoding);
+    File.SetLastWriteTimeUtc(goodFacade, World.Mtime.UtcDateTime);
+
+    var first = await world.Run(false);
+    Check(first.ExitCode == 0, "invalid json stopped the run: " + first.StopReason);
+    Check(first.SkippedLogs.Count == 2, "skip count " + first.SkippedLogs.Count);
+    Check(first.SkippedLogs.Any(skip => skip.LineNumber == 2 && skip.Path == rollout), "codex line was not skipped");
+    Check(first.SkippedLogs.Any(skip => skip.LineNumber == 1 && skip.Path == badFacade), "facade line was not skipped");
+    Check(world.Store.ListByNative("codex", "sess").Count(item => item.Draft.Kind == "user_message") == 1, "valid codex line was dropped");
+    Check(world.Store.ListByNative("facade", "b").Any(item => item.Draft.Kind == "started"), "later facade file was not read");
+    var report = File.ReadAllText(first.ReportPath);
+    Check(report.Contains("2 行目", StringComparison.Ordinal), "report missed the codex line");
+    Check(report.Contains("a.events.jsonl の 1 行目", StringComparison.Ordinal), "report missed the facade line");
+
+    var second = await world.Run(false);
+    Check(second.ExitCode == 0, "second run stopped: " + second.StopReason);
+    Check(second.SkippedLogs.Count == 0, "skipped line was reported again");
+    Check(world.Store.ListByNative("codex", "sess").Count(item => item.Draft.Kind == "user_message") == 1, "second run duplicated the message");
+}
+
+async Task InvalidUtf8Chunk()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var badPath = world.RolloutPath();
+    Directory.CreateDirectory(Path.GetDirectoryName(badPath)!);
+    using (var stream = File.Create(badPath))
+    {
+        stream.Write(World.FileEncoding.GetBytes(LogText.Meta("sess-bad", "https://github.com/acme/widgets") + "\n"));
+        stream.WriteByte(0xFF);
+        stream.WriteByte((byte)'\n');
+        stream.Write(World.FileEncoding.GetBytes(LogText.Message("実装を開始した。") + "\n"));
+    }
+
+    File.SetLastWriteTimeUtc(badPath, World.Mtime.UtcDateTime);
+    var later = Path.Combine(world.Config.CodexSessionsDir, "2026", "11", "01", "rollout-later.jsonl");
+    File.WriteAllText(later, LogText.Meta("sess-later", "https://github.com/acme/widgets") + "\n" + LogText.Message("実装を開始した。") + "\n", World.FileEncoding);
+    File.SetLastWriteTimeUtc(later, World.Mtime.UtcDateTime);
+
+    var first = await world.Run(false);
+    Check(first.ExitCode == 0, "invalid utf-8 stopped the run: " + first.StopReason);
+    Check(first.SkippedLogs.Count == 1 && first.SkippedLogs[0].LineNumber is null && first.SkippedLogs[0].Path == badPath, "utf-8 chunk was not reported as a file skip");
+    Check(world.Store.ListByNative("codex", "sess-bad").Count == 0, "undecodable chunk was ingested");
+    Check(world.Store.ListByNative("codex", "sess-later").Count(item => item.Draft.Kind == "user_message") == 1, "later file was not read");
+    var cursor = world.Store.GetCursor(badPath);
+    var length = new FileInfo(badPath).Length;
+    Check(cursor is not null && cursor.ByteOffset == length && cursor.NextLine == 4, "utf-8 cursor did not advance past the chunk");
+    Check(File.ReadAllText(first.ReportPath).Contains("not valid UTF-8", StringComparison.Ordinal), "report missed the utf-8 skip");
+
+    var second = await world.Run(false);
+    Check(second.ExitCode == 0, "second utf-8 run stopped: " + second.StopReason);
+    Check(second.SkippedLogs.Count == 0, "utf-8 chunk was reported again");
+    Check(world.Store.ListByNative("codex", "sess-later").Count(item => item.Draft.Kind == "user_message") == 1, "second run duplicated the later file");
 }
 
 async Task ClosedUnmerged()

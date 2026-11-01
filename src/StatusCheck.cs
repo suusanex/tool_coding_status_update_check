@@ -88,6 +88,11 @@ internal static class Cli
 
     private static void Print(RunResult result)
     {
+        foreach (var skip in result.SkippedLogs)
+        {
+            Console.Error.WriteLine(skip.ToLog());
+        }
+
         if (!string.IsNullOrWhiteSpace(result.ReportPath))
         {
             Console.WriteLine("report: " + result.ReportPath);

@@ -16,9 +16,10 @@ internal static class StatusPipeline
         request.Store.InsertRun(runId, request.Window);
         string? reportPath = null;
         string? proposalPath = null;
+        var skips = new List<IngestSkip>();
         try
         {
-            Ingest(request);
+            skips.AddRange(Ingest(request));
             var packets = BuildPackets(request.Store, request.Window);
             var views = await AnalyzeAsync(request, packets, cancellationToken);
             await RefreshTrackedAsync(request, views, cancellationToken);
@@ -50,7 +51,7 @@ internal static class StatusPipeline
             }
 
             var usage = request.Store.UsageTotals(runId);
-            reportPath = WriteReport(request, runId, views, holds, concentrations, LedgerText(request.ApplyLedger, staged, applied, stop), usage);
+            reportPath = WriteReport(request, runId, views, holds, concentrations, LedgerText(request.ApplyLedger, staged, applied, stop), usage, skips);
             request.Store.FinishRun(runId, exit == 0 ? "succeeded" : "failed", reportPath, proposalPath);
             return new RunResult
             {
@@ -59,6 +60,7 @@ internal static class StatusPipeline
                 AppliedCards = applied,
                 StopReason = stop,
                 ExitCode = exit,
+                SkippedLogs = skips,
             };
         }
         catch (Exception ex) when (ex is StatusCheckException or AggregateException)
@@ -74,6 +76,7 @@ internal static class StatusPipeline
                 AppliedCards = [],
                 StopReason = message,
                 ExitCode = 1,
+                SkippedLogs = skips,
             };
         }
     }
@@ -121,18 +124,20 @@ internal static class StatusPipeline
         return new RunResult { RunId = runId, ReportPath = "", AppliedCards = applied, StopReason = null, ExitCode = 0 };
     }
 
-    private static void Ingest(RunRequest request)
+    private static List<IngestSkip> Ingest(RunRequest request)
     {
-        IngestRoot(request, request.Config.CodexSessionsDir, "codex", searchAllDirectories: true);
+        var skips = new List<IngestSkip>();
+        IngestRoot(request, request.Config.CodexSessionsDir, "codex", searchAllDirectories: true, skips);
         if (!string.IsNullOrWhiteSpace(request.Config.CodexArchivedSessionsDir))
         {
-            IngestRoot(request, request.Config.CodexArchivedSessionsDir, "codex", searchAllDirectories: true);
+            IngestRoot(request, request.Config.CodexArchivedSessionsDir, "codex", searchAllDirectories: true, skips);
         }
 
-        IngestRoot(request, request.Config.FacadeRunsDir, "facade", searchAllDirectories: false);
+        IngestRoot(request, request.Config.FacadeRunsDir, "facade", searchAllDirectories: false, skips);
+        return skips;
     }
 
-    private static void IngestRoot(RunRequest request, string root, string source, bool searchAllDirectories)
+    private static void IngestRoot(RunRequest request, string root, string source, bool searchAllDirectories, List<IngestSkip> skips)
     {
         if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
         {
@@ -154,6 +159,11 @@ internal static class StatusPipeline
             }
 
             var read = ByteLog.Read(path, cursor?.ByteOffset ?? 0, cursor?.Size ?? 0, cursor?.PrefixHash, cursor?.NextLine ?? 1);
+            if (read.DecodeError is not null)
+            {
+                skips.Add(new IngestSkip(path, null, read.DecodeError));
+            }
+
             if (read.Reset)
             {
                 request.Store.DeleteObservationsForFile(path);
@@ -169,9 +179,19 @@ internal static class StatusPipeline
             };
             foreach (var line in read.Lines)
             {
-                var draft = source == "codex"
-                    ? CodexCollector.ParseLine(path, line, carry)
-                    : FacadeCollector.ParseLine(path, line, carry);
+                ObservationDraft? draft;
+                try
+                {
+                    draft = source == "codex"
+                        ? CodexCollector.ParseLine(path, line, carry)
+                        : FacadeCollector.ParseLine(path, line, carry);
+                }
+                catch (InvalidLogLineException ex)
+                {
+                    skips.Add(new IngestSkip(path, line.Number, ex.Message));
+                    continue;
+                }
+
                 if (draft is not null)
                 {
                     request.Store.UpsertObservation(draft);
@@ -607,7 +627,7 @@ internal static class StatusPipeline
         return changes.Select(change => change.RelativePath).ToList();
     }
 
-    private static string WriteReport(RunRequest request, string runId, IReadOnlyList<ActivityView> views, IReadOnlyList<HoldNote> holds, IReadOnlyList<ConcentrationItem> concentrations, string ledgerSummary, (int InputTokens, int OutputTokens, decimal Usd) usage)
+    private static string WriteReport(RunRequest request, string runId, IReadOnlyList<ActivityView> views, IReadOnlyList<HoldNote> holds, IReadOnlyList<ConcentrationItem> concentrations, string ledgerSummary, (int InputTokens, int OutputTokens, decimal Usd) usage, IReadOnlyList<IngestSkip> skips)
     {
         var directory = Path.Combine(request.Config.ReportsDirectory, runId);
         Directory.CreateDirectory(directory);
@@ -623,6 +643,7 @@ internal static class StatusPipeline
             InputTokens = usage.InputTokens,
             OutputTokens = usage.OutputTokens,
             EstimatedUsd = usage.Usd,
+            SkippedLogs = skips,
         });
         File.WriteAllText(path, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         return path;
@@ -868,6 +889,7 @@ internal sealed class RunResult
     public required IReadOnlyList<string> AppliedCards { get; init; }
     public string? StopReason { get; init; }
     public int ExitCode { get; init; }
+    public IReadOnlyList<IngestSkip> SkippedLogs { get; init; } = [];
 }
 
 internal sealed class SourcePacket

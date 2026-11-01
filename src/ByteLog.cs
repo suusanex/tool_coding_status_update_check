@@ -4,12 +4,13 @@ using System.Text;
 /// <summary>
 /// JSONLの追記だけを読む。末尾の改行が無い行は消費しない。
 /// 先頭4096バイトのハッシュが変わった、または短くなったファイルは先頭から読み直す。
+/// UTF-8 として読めないチャンクは行に分けず、その範囲を消費済みにして理由を返す。
 /// </summary>
 internal static class ByteLog
 {
     internal sealed record LogLine(long Number, string Text);
 
-    internal sealed record ReadResult(bool Reset, long NewOffset, long Size, string PrefixHash, long NextLine, IReadOnlyList<LogLine> Lines);
+    internal sealed record ReadResult(bool Reset, long NewOffset, long Size, string PrefixHash, long NextLine, IReadOnlyList<LogLine> Lines, string? DecodeError = null);
 
     private static readonly Encoding Utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
@@ -52,7 +53,18 @@ internal static class ByteLog
         }
         catch (DecoderFallbackException ex)
         {
-            throw new StatusCheckException($"The log is not valid UTF-8: {path}", ex);
+            // 改行バイトまでは区切れるが、UTF-8 として壊れたチャンクは行本文にできない。
+            // 同じ範囲を次回も読むと実行が毎回止まるので、チャンク全体を消費済みにする。
+            var newlines = 0;
+            for (var i = 0; i <= lastNewline; i++)
+            {
+                if (data[i] == (byte)'\n')
+                {
+                    newlines++;
+                }
+            }
+
+            return new ReadResult(reset, start + lastNewline + 1, size, prefixHash, lineNumber + newlines, [], "The log chunk is not valid UTF-8. " + ex.Message);
         }
 
         var lines = new List<LogLine>();

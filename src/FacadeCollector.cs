@@ -23,7 +23,7 @@ internal static class FacadeCollector
         }
         catch (JsonException ex)
         {
-            throw new StatusCheckException($"Facade log line {line.Number} in {path} is not valid JSON.", ex);
+            throw new InvalidLogLineException(ex.Message);
         }
 
         using (document)

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json.Nodes;
 
 /// <summary>
@@ -365,6 +366,42 @@ internal sealed class StatusCheckException : Exception
 
     public StatusCheckException(string message, Exception inner) : base(message, inner)
     {
+    }
+}
+
+/// <summary>
+/// 改行まで読めたログ行が JSON ではない。実行は止めず、この行だけを飛ばす。
+/// </summary>
+internal sealed class InvalidLogLineException : Exception
+{
+    public InvalidLogLineException(string message) : base(message)
+    {
+    }
+}
+
+/// <summary>
+/// 読めなかったログの位置。本文は残さない。
+/// </summary>
+internal sealed record IngestSkip(string Path, long? LineNumber, string Message)
+{
+    public string ToLog()
+    {
+        if (LineNumber is long line)
+        {
+            return "skipped log line " + line.ToString(CultureInfo.InvariantCulture) + " in " + Path + ": " + Message;
+        }
+
+        return "skipped log file " + Path + ": " + Message;
+    }
+
+    public string ToReport()
+    {
+        if (LineNumber is long line)
+        {
+            return Path + " の " + line.ToString(CultureInfo.InvariantCulture) + " 行目: " + Message;
+        }
+
+        return Path + ": " + Message;
     }
 }
 
