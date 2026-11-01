@@ -40,6 +40,10 @@ await Case("invalid utf-8 chunk is skipped", InvalidUtf8Chunk);
 await Case("an old file mtime does not drop in-window events", OldMtimeInWindow);
 await Case("an old observation body is not sent", OldObservation);
 await Case("estimate counts the selected payload and does not call the model", EstimateOnly);
+await Case("an open pull on another report blocks deletion", OpenPullBlocksDelete);
+await Case("a replaced rollout does not keep the old thread", ReplacedRolloutDropsOldThread);
+await Case("an outside merge stays with an active card", OutsideMergeJoinsActiveCard);
+await Case("an unselected pull does not hold the card", UnselectedPullDoesNotHold);
 await Case("openai failure keeps status and detail", OpenAiFailureMessage);
 
 if (failures.Count > 0)
@@ -543,8 +547,174 @@ async Task EstimateOnly()
     Check(report.Contains("APIは呼び出していない", StringComparison.Ordinal), "estimate report missed the dry-run notice");
     Check(report.Contains("途中ログは送信対象に含めていない", StringComparison.Ordinal), "estimate report missed the mid-log notice");
     Check(report.Contains("途中ログがpayloadに含まれる: いいえ", StringComparison.Ordinal), "tool update was treated as payload");
+    Check(report.Contains("reconcile 呼び出しは上限である", StringComparison.Ordinal), "estimate hid that reconcile counts are an upper bound");
     Check(!report.Contains("SECRET_ESTIMATE", StringComparison.Ordinal), "estimate report included the tool body");
 }
+
+Task OpenPullBlocksDelete()
+{
+    var card = CardParser.Parse("projects/widgets.md", TwoCard(null));
+    var open = Snapshot(7, PullRequestState.Open);
+    var merged = Snapshot(8, PullRequestState.Merged);
+    var older = ReportView("old", "先に出した。 https://github.com/acme/widgets/pull/7", "2026-11-01T00:20:00Z", open);
+    var newer = ReportView("new", "実装を完了した。 https://github.com/acme/widgets/pull/8", "2026-11-01T00:40:00Z", merged);
+    var blocked = LedgerPlanner.Apply(card, [older, newer], [new LedgerFieldUpdate("ウィジェット修正", "delete", "", "", "", "")]);
+    Check(blocked is not null && blocked.NewText.Contains("### ウィジェット修正", StringComparison.Ordinal), "open pull was deleted");
+    Check(blocked!.NewText.Contains("pull/8", StringComparison.Ordinal), "new pull was dropped");
+
+    var both = LedgerPlanner.Apply(
+        card,
+        [
+            ReportView("old", "先に出した。 https://github.com/acme/widgets/pull/7", "2026-11-01T00:20:00Z", Snapshot(7, PullRequestState.Merged)),
+            newer,
+        ],
+        [new LedgerFieldUpdate("ウィジェット修正", "delete", "", "", "", "")]);
+    Check(both is not null && !both.NewText.Contains("### ウィジェット修正", StringComparison.Ordinal), "merged pulls kept the workstream");
+    Check(both!.NewText.Contains("### 文書整理", StringComparison.Ordinal), "other workstream was removed with the merged pulls");
+    return Task.CompletedTask;
+}
+
+async Task ReplacedRolloutDropsOldThread()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout(
+        "old-session",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("計画のみで、実装はしていない。", "final_answer"));
+    await world.Run(false);
+    var path = world.RolloutPath("old-session");
+    File.WriteAllText(
+        path,
+        string.Join("\n", LogText.Meta("new-session", "https://github.com/acme/widgets"), LogText.User("ウィジェットを直して。"), LogText.Assistant("実装を開始した。", "final_answer")) + "\n",
+        World.FileEncoding);
+    File.SetLastWriteTimeUtc(path, World.Mtime.UtcDateTime);
+    await world.Run(false);
+    Check(world.Store.GetThread("codex", "old-session") is null, "replaced file kept the old thread");
+    Check(world.Store.GetThread("codex", "new-session")?.Response?.Text.Contains("実装を開始した。", StringComparison.Ordinal) == true, "replacement thread was not read");
+}
+
+async Task OutsideMergeJoinsActiveCard()
+{
+    await using var world = World.Create();
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    world.WriteRollout(
+        "old",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:20:00Z"));
+    await world.Run(true);
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero));
+    world.WriteRollout(
+        "new",
+        "https://github.com/acme/widgets",
+        LogText.User("文書の担当を確認して。", "2026-11-02T00:11:00Z"),
+        LogText.Assistant("文書整理はまだである。", "final_answer", "2026-11-02T00:20:00Z"));
+    await world.Run(true, window: World.Day(2));
+    Check(
+        world.Model.Payloads.Any(payload => payload.Contains("実装を完了した。", StringComparison.Ordinal) && payload.Contains("文書整理はまだである。", StringComparison.Ordinal)),
+        "outside merged thread was dropped from the active card");
+}
+
+async Task UnselectedPullDoesNotHold()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("https://github.com/acme/widgets/pull/7"));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    var other = Path.Combine(world.Ledger, "projects", "other.md");
+    File.WriteAllText(
+        other,
+        """
+        ---
+        status: active
+        repositories:
+          - acme/other
+        ---
+
+        # Other
+
+        ## 目的
+
+        別件。
+
+        ## 現在地
+
+        別件を見ている。
+
+        ## 進行中のworkstream
+
+        ### 別件
+
+        **現在地**
+
+        別件を見ている。
+
+        **次のアクション**
+
+        続ける。
+
+        **待ち・阻害要因**
+
+        なし。
+
+        **参照**
+
+        https://github.com/acme/other/pull/9
+        """,
+        World.FileEncoding);
+    LedgerGit.Run(world.Ledger, ["add", "--", "projects/other.md"]);
+    LedgerGit.Run(world.Ledger, ["commit", "-m", "other"]);
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("別件 https://github.com/acme/other/pull/9 は対象外。ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
+    var result = await world.Run(false);
+    var report = File.ReadAllText(result.ReportPath);
+    Check(!report.Contains("複数のProjectカード", StringComparison.Ordinal), "unselected pull forced a hold");
+    Check(world.Model.Payloads.Any(payload => payload.Contains("projects/widgets.md", StringComparison.Ordinal)), "selected pull did not reach reconcile");
+}
+
+static ThreadView ReportView(string id, string response, string at, PullRequestSnapshot pull)
+{
+    var timestamp = DateTimeOffset.Parse(at, System.Globalization.CultureInfo.InvariantCulture);
+    return new ThreadView
+    {
+        Thread = new ThreadRecord
+        {
+            Source = "codex",
+            NativeId = id,
+            FilePath = id + ".jsonl",
+            Response = new SelectedExcerpt(response, timestamp, 1, "response_item final_answer"),
+            LastEventUtc = timestamp,
+            Fingerprint = id,
+        },
+        Assessment = new ThreadAssessment
+        {
+            Summary = response,
+            Purpose = "",
+            CurrentPosition = response,
+            ExplicitRemainingWork = "",
+            NextAction = "",
+            Uncertainty = "",
+            SelectedPullUrls = [pull.Url],
+        },
+        Pulls = [pull],
+    };
+}
+
+static PullRequestSnapshot Snapshot(int number, PullRequestState state) =>
+    new(
+        "https://github.com/acme/widgets/pull/" + number.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        "acme",
+        "widgets",
+        number,
+        state,
+        state == PullRequestState.Merged ? new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero) : null,
+        null,
+        "title");
 
 Task OpenAiFailureMessage()
 {

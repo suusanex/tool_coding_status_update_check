@@ -337,7 +337,7 @@ internal static class LedgerPlanner
             }
 
             var action = update.Action.ToLowerInvariant();
-            var relevant = Relevant(slice, reports);
+            var relevant = Relevant(card, slice, reports);
             if (action == "delete" && !CanDelete(relevant))
             {
                 action = "update";
@@ -456,16 +456,29 @@ internal static class LedgerPlanner
             return false;
         }
 
-        var latest = Latest(reports);
-        return latest is not null &&
-            latest.Pulls.Count > 0 &&
-            latest.Pulls.All(pull => pull.State == PullRequestState.Merged);
+        var pulls = reports.SelectMany(report => report.Pulls).ToList();
+        return pulls.Count > 0 && pulls.All(pull => pull.State == PullRequestState.Merged);
     }
 
-    private static IReadOnlyList<ThreadView> Relevant(WorkstreamSlice slice, IReadOnlyList<ThreadView> reports)
+    private static bool Links(ThreadView report, WorkstreamSlice slice) =>
+        report.Pulls.Any(pull => slice.Raw.Contains(pull.Url, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// カードに既にある URL の報告だけに絞ると、同じ workstream の新しい PR が脱落する。
+    /// 他の workstream に紐づかない報告は残す。
+    /// </summary>
+    private static IReadOnlyList<ThreadView> Relevant(ProjectCard card, WorkstreamSlice slice, IReadOnlyList<ThreadView> reports)
     {
-        var linked = reports.Where(report => report.Pulls.Any(pull => slice.Raw.Contains(pull.Url, StringComparison.OrdinalIgnoreCase))).ToList();
-        return linked.Count > 0 ? linked : reports;
+        var linked = reports.Where(report => Links(report, slice)).ToList();
+        if (linked.Count == 0)
+        {
+            return reports;
+        }
+
+        var extras = reports.Where(report =>
+            !linked.Contains(report) &&
+            card.Workstreams.All(other => other.Heading == slice.Heading || !Links(report, other)));
+        return linked.Concat(extras).ToList();
     }
 
     private static ThreadView? Latest(IReadOnlyList<ThreadView> reports) =>
