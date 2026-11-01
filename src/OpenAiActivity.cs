@@ -58,27 +58,55 @@ internal sealed class OpenAiActivityModel : IActivityModel
     {
         var projectedInput = Math.Max(1, (system.Length + user.Length) / 4);
         var projected = Pricing.EstimateUsd(projectedInput, 4000);
+        var reserved = false;
         lock (_gate)
         {
             if (_maxUsd is not null && (_spent >= _maxUsd.Value || _spent + projected > _maxUsd.Value))
             {
                 throw new StatusCheckException("Estimated spend reached --max-usd before the next model call.");
             }
+
+            if (_maxUsd is not null)
+            {
+                _spent += projected;
+                reserved = true;
+            }
         }
 
-        ClientResult<ResponseResult> result = await SendAsync(system, user, schemaName, schema, cancellationToken);
-        var text = result.Value.GetOutputText();
-        var usage = result.Value.Usage;
-        var input = usage?.InputTokenCount ?? projectedInput;
-        var output = usage?.OutputTokenCount ?? 0;
-        var cost = Pricing.EstimateUsd(input, output);
-        lock (_gate)
+        try
         {
-            _spent += cost;
-        }
+            ClientResult<ResponseResult> result = await SendAsync(system, user, schemaName, schema, cancellationToken);
+            var text = result.Value.GetOutputText();
+            var usage = result.Value.Usage;
+            var input = usage?.InputTokenCount ?? projectedInput;
+            var output = usage?.OutputTokenCount ?? 0;
+            var cost = Pricing.EstimateUsd(input, output);
+            lock (_gate)
+            {
+                if (reserved)
+                {
+                    _spent += cost - projected;
+                    reserved = false;
+                }
+                else
+                {
+                    _spent += cost;
+                }
+            }
 
-        _store.RecordUsage(_runId, stage, _model, input, output, cost);
-        return parse(text);
+            _store.RecordUsage(_runId, stage, _model, input, output, cost);
+            return parse(text);
+        }
+        finally
+        {
+            if (reserved)
+            {
+                lock (_gate)
+                {
+                    _spent -= projected;
+                }
+            }
+        }
     }
 
     private async Task<ClientResult<ResponseResult>> SendAsync(string system, string user, string schemaName, string schema, CancellationToken cancellationToken)
@@ -104,10 +132,19 @@ internal sealed class OpenAiActivityModel : IActivityModel
                 options.InputItems.Add(ResponseItem.CreateUserMessageItem(user));
                 return await _client.CreateResponseAsync(options, cancellationToken);
             }
-            catch (ClientResultException ex) when (attempt < _maxRetries && (ex.Status == 429 || ex.Status >= 500))
+            catch (ClientResultException ex) when (ex.Status == 429 || ex.Status >= 500)
             {
                 last = ex;
+                if (attempt == _maxRetries)
+                {
+                    break;
+                }
+
                 await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), cancellationToken);
+            }
+            catch (ClientResultException ex)
+            {
+                throw new StatusCheckException("The OpenAI request failed.", ex);
             }
         }
 

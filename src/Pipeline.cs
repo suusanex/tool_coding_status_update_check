@@ -145,11 +145,6 @@ internal static class StatusPipeline
         {
             var info = new FileInfo(path);
             var cursor = request.Store.GetCursor(path);
-            if (cursor is null && info.LastWriteTimeUtc < request.Window.FromUtc.AddDays(-1))
-            {
-                continue;
-            }
-
             if (cursor is not null &&
                 cursor.Size == info.Length &&
                 cursor.ByteOffset == info.Length &&
@@ -795,6 +790,26 @@ internal static class PacketSplitter
         foreach (var observation in observations)
         {
             var length = observation.Draft.Body.Length + observation.Id.Length + 32;
+            if (length > maxChars)
+            {
+                if (current.Count > 0)
+                {
+                    slices.Add(current);
+                    current = [];
+                    size = 0;
+                }
+
+                var budget = Math.Max(1, maxChars - observation.Id.Length - 32);
+                var body = observation.Draft.Body;
+                for (var start = 0; start < body.Length; start += budget)
+                {
+                    var sliceLength = Math.Min(budget, body.Length - start);
+                    slices.Add([Slice(observation, body.Substring(start, sliceLength))]);
+                }
+
+                continue;
+            }
+
             if (current.Count > 0 && size + length > maxChars)
             {
                 slices.Add(current);
@@ -813,6 +828,24 @@ internal static class PacketSplitter
 
         return slices.Count == 0 ? [[]] : slices;
     }
+
+    private static StoredObservation Slice(StoredObservation observation, string body) => new()
+    {
+        Id = observation.Id,
+        Draft = new ObservationDraft
+        {
+            Source = observation.Draft.Source,
+            NativeId = observation.Draft.NativeId,
+            FilePath = observation.Draft.FilePath,
+            Ordinal = observation.Draft.Ordinal,
+            Timestamp = observation.Draft.Timestamp,
+            Kind = observation.Draft.Kind,
+            Body = body,
+            DetailJson = observation.Draft.DetailJson,
+            Urls = observation.Draft.Urls,
+            RunIds = observation.Draft.RunIds,
+        },
+    };
 }
 
 internal sealed class RunRequest
