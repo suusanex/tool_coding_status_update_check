@@ -299,6 +299,7 @@ internal sealed class LedgerChange
     public required string BlobBefore { get; init; }
     public required string NewText { get; init; }
     public required IReadOnlyList<LedgerDecision> Decisions { get; init; }
+    public IReadOnlyList<ProposalPull> Pulls { get; init; } = [];
 }
 
 internal sealed class HoldNote
@@ -311,200 +312,182 @@ internal static class LedgerPlanner
 {
     internal const string CompletionFact = "対応PRはマージ済みで、明示的な残作業は記録されていない。";
 
-    internal static async Task<(IReadOnlyList<LedgerChange> Changes, IReadOnlyList<HoldNote> Holds)> PlanAsync(
-        IReadOnlyList<ProjectCard> cards,
-        IReadOnlyList<ActivityView> activities,
-        StateStore store,
-        IActivityModel model,
-        CancellationToken cancellationToken)
+    internal static LedgerChange? Apply(
+        ProjectCard card,
+        IReadOnlyList<ThreadView> reports,
+        IReadOnlyList<LedgerFieldUpdate> updates)
     {
-        var edits = new Dictionary<string, (ProjectCard Card, List<(int Start, int Length, string Replacement)> Edits, string? Current, HashSet<string> Touched, List<LedgerDecision> Decisions)>(StringComparer.Ordinal);
-        var holds = new List<HoldNote>();
-        foreach (var activity in activities.Where(activity => activity.Kind != "status_check_self").OrderBy(activity => string.IsNullOrEmpty(activity.DiscoveredFrom) ? 0 : 1).ThenBy(activity => activity.Id, StringComparer.Ordinal))
+        var newline = card.Text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var edits = new Dictionary<string, (int Start, int Length, string Replacement)>(StringComparer.Ordinal);
+        var decisions = new List<LedgerDecision>();
+        var pullStates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string? current = null;
+        var touched = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var update in updates)
         {
-            var match = await MatchAsync(activity, cards, store, model, cancellationToken);
-            if (match.Card is null || match.Workstream is null)
+            if (string.IsNullOrWhiteSpace(update.Workstream) || update.Action.Equals("none", StringComparison.OrdinalIgnoreCase))
             {
-                if (match.Hold is not null)
-                {
-                    holds.Add(match.Hold);
-                }
-
                 continue;
             }
 
-            var card = match.Card;
-            var slice = match.Workstream;
-            var action = Decide(activity);
-            if (!edits.TryGetValue(card.RelativePath, out var bucket))
+            var slice = card.Workstreams.FirstOrDefault(workstream => workstream.Heading == update.Workstream);
+            if (slice is null)
             {
-                bucket = (card, [], null, [], []);
-                edits[card.RelativePath] = bucket;
+                continue;
             }
 
-            if (!bucket.Touched.Add(slice.Heading))
+            var action = update.Action.ToLowerInvariant();
+            var relevant = Relevant(slice, reports);
+            if (action == "delete" && !CanDelete(relevant))
             {
-                if (!string.IsNullOrEmpty(activity.DiscoveredFrom))
-                {
-                    holds.Add(new HoldNote { ActivityId = activity.Id, Reason = "独立課題は別活動として残したが、同じworkstreamへは重ねて書かない。" });
-                    continue;
-                }
-
-                throw new StatusCheckException("Multiple activities selected the same workstream: " + slice.Heading);
+                action = "update";
             }
 
-            var newline = card.Text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
             if (action == "delete")
             {
-                bucket.Edits.Add((slice.Start, slice.Length, ""));
-                bucket.Current = CardParser.RewriteCurrent(bucket.Current ?? card.Current, slice.Current, CompletionFact, newline);
+                edits[slice.Heading] = (slice.Start, slice.Length, "");
+                current = CardParser.RewriteCurrent(current ?? card.Current, slice.Current, CompletionFact, newline);
             }
             else
             {
-                var rendered = RenderUpdate(activity, slice, newline);
-                bucket.Edits.Add((slice.Start, slice.Length, rendered));
+                var latest = Latest(relevant);
+                var renderedCurrent = FirstText(update.Current, latest?.Assessment?.CurrentPosition, slice.Current);
+                var renderedNext = FirstText(update.Next, latest?.Assessment?.NextAction, slice.Next);
+                var renderedWaiting = FirstText(update.Waiting, latest?.Assessment?.ExplicitRemainingWork, slice.Waiting);
+                if (string.IsNullOrWhiteSpace(latest?.Assessment?.ExplicitRemainingWork) &&
+                    slice.Current.Contains(renderedCurrent, StringComparison.Ordinal) &&
+                    (string.IsNullOrWhiteSpace(update.Next) || slice.Next.Contains(renderedNext, StringComparison.Ordinal)) &&
+                    (string.IsNullOrWhiteSpace(update.Waiting) || slice.Waiting.Contains(renderedWaiting, StringComparison.Ordinal) || slice.Current.Contains(renderedWaiting, StringComparison.Ordinal)))
+                {
+                    var urls = relevant.SelectMany(report => report.Pulls.Select(pull => pull.Url));
+                    if (urls.All(url => slice.References.Contains(url, StringComparison.Ordinal)))
+                    {
+                        continue;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(latest?.Assessment?.ExplicitRemainingWork))
+                {
+                    renderedWaiting = latest!.Assessment!.ExplicitRemainingWork;
+                    if (string.IsNullOrWhiteSpace(update.Next))
+                    {
+                        renderedNext = "管理側へこの残作業を戻す。";
+                    }
+                }
+
+                var references = AppendUrls(slice.References, relevant.SelectMany(report => report.Pulls.Select(pull => pull.Url)), newline);
+                edits[slice.Heading] = (slice.Start, slice.Length, CardParser.RenderWorkstream(slice.Heading, renderedCurrent, renderedNext, renderedWaiting, references, newline));
             }
 
-            var key = Normalize.ShortHash(activity.Id + "\n" + card.RelativePath + "\n" + slice.Heading + "\n" + action + "\n" + string.Join(",", activity.PullRequests.OrderBy(pull => pull.Url, StringComparer.Ordinal).Select(pull => pull.Url + ":" + pull.State)));
-            bucket.Decisions.Add(new LedgerDecision
+            touched.Add(slice.Heading);
+            foreach (var pull in relevant.SelectMany(report => report.Pulls))
             {
-                Key = key,
-                ActivityId = activity.Id,
+                pullStates[pull.Url] = pull.State.ToString();
+            }
+
+            var activityId = LatestActivity(relevant);
+            var pullKey = string.Join(",", relevant.SelectMany(report => report.Pulls).OrderBy(pull => pull.Url, StringComparer.Ordinal).Select(pull => pull.Url + ":" + pull.State));
+            decisions.Add(new LedgerDecision
+            {
+                Key = Normalize.ShortHash(activityId + "\n" + card.RelativePath + "\n" + slice.Heading + "\n" + action + "\n" + pullKey),
+                ActivityId = activityId,
                 Workstream = slice.Heading,
                 Action = action,
                 RelativePath = card.RelativePath,
             });
-            edits[card.RelativePath] = bucket;
         }
 
-        var changes = new List<LedgerChange>();
-        foreach (var entry in edits.Values)
+        if (decisions.Count == 0)
         {
-            if (entry.Decisions.Count == 0)
+            return null;
+        }
+
+        var updated = CardParser.ReplacePieces(card.Text, current, edits.Values.ToList());
+        if (updated == card.Text)
+        {
+            return null;
+        }
+
+        var after = CardParser.Parse(card.RelativePath, updated);
+        CardParser.Validate(card, after, touched);
+        foreach (var decision in decisions.Where(decision => decision.Action == "delete"))
+        {
+            if (after.Workstreams.Any(workstream => workstream.Heading == decision.Workstream))
             {
-                continue;
+                throw new StatusCheckException("Completed workstream was not removed: " + decision.Workstream);
             }
+        }
 
-            var updated = CardParser.ReplacePieces(entry.Card.Text, entry.Current, entry.Edits);
-            if (updated == entry.Card.Text)
+        if (decisions.Any(decision => decision.Action == "delete"))
+        {
+            var others = card.Workstreams.Where(workstream => decisions.All(decision => decision.Action != "delete" || decision.Workstream != workstream.Heading)).ToList();
+            foreach (var other in others)
             {
-                continue;
-            }
-
-            var after = CardParser.Parse(entry.Card.RelativePath, updated);
-            CardParser.Validate(entry.Card, after, entry.Touched);
-            if (entry.Decisions.Any(decision => decision.Action == "delete"))
-            {
-                foreach (var decision in entry.Decisions.Where(decision => decision.Action == "delete"))
+                foreach (var sentence in Normalize.SplitSentences(other.Current))
                 {
-                    if (after.Workstreams.Any(workstream => workstream.Heading == decision.Workstream))
+                    var trimmed = sentence.Trim();
+                    if (trimmed.Length >= 8 && card.Current.Contains(trimmed, StringComparison.Ordinal) && !after.Current.Contains(trimmed, StringComparison.Ordinal))
                     {
-                        throw new StatusCheckException("Completed workstream was not removed: " + decision.Workstream);
-                    }
-                }
-
-                var others = entry.Card.Workstreams.Where(workstream => entry.Decisions.All(decision => decision.Action != "delete" || decision.Workstream != workstream.Heading)).ToList();
-                var newCurrent = after.Current;
-                foreach (var other in others)
-                {
-                    foreach (var sentence in Normalize.SplitSentences(other.Current))
-                    {
-                        var trimmed = sentence.Trim();
-                        if (trimmed.Length >= 8 && entry.Card.Current.Contains(trimmed, StringComparison.Ordinal) && !newCurrent.Contains(trimmed, StringComparison.Ordinal))
-                        {
-                            throw new StatusCheckException("Project current position dropped text that belongs to another workstream.");
-                        }
+                        throw new StatusCheckException("Project current position dropped text that belongs to another workstream.");
                     }
                 }
             }
-
-            changes.Add(new LedgerChange
-            {
-                RelativePath = entry.Card.RelativePath,
-                BlobBefore = "",
-                NewText = updated,
-                Decisions = entry.Decisions,
-            });
         }
 
-        return (changes, holds);
-    }
-
-    /// <summary>
-    /// 削除は、送り切った本文に確認できる残作業がなく、活動の根拠から取った pull がすべてマージ済みのときだけ行う。
-    /// workstream 本文の URL 件数やキーワードでは完了範囲を決めない。
-    /// </summary>
-    private static string Decide(ActivityView activity)
-    {
-        if (activity.CoverageComplete &&
-            string.IsNullOrWhiteSpace(activity.ExplicitRemainingWork) &&
-            activity.PullRequests.Count > 0 &&
-            activity.PullRequests.All(pull => pull.State == PullRequestState.Merged))
+        return new LedgerChange
         {
-            return "delete";
-        }
-
-        return "update";
-    }
-
-    private static string RenderUpdate(ActivityView activity, WorkstreamSlice slice, string newline)
-    {
-        var references = AppendUrls(slice.References, activity.PullRequests.Select(pull => pull.Url).Concat(activity.IssueRefs.Select(issue => issue.Url)), newline);
-        var pulls = activity.PullRequests;
-        string current;
-        string next;
-        string waiting = slice.Waiting;
-        if (!string.IsNullOrWhiteSpace(activity.ExplicitRemainingWork))
-        {
-            current = activity.ExplicitRemainingWork!;
-            next = "管理側へこの残作業を戻す。";
-            waiting = activity.ExplicitRemainingWork!;
-        }
-        else if (!activity.CoverageComplete && pulls.Count > 0 && pulls.All(pull => pull.State == PullRequestState.Merged))
-        {
-            current = "未送信の本文があるため、明示的な残作業がないとは扱わない。";
-            next = slice.Next;
-        }
-        else if (pulls.Count > 0)
-        {
-            current = string.Join(newline, pulls.OrderBy(pull => pull.Url, StringComparer.Ordinal).Select(DescribePull));
-            next = pulls.All(pull => pull.State == PullRequestState.Merged)
-                ? (string.IsNullOrWhiteSpace(activity.NextAction) ? slice.Next : activity.NextAction)
-                : (string.IsNullOrWhiteSpace(slice.Next) ? "未マージのPRを確認する。" : slice.Next);
-        }
-        else if (activity.Stages.Contains(StageNames.PlanOnly) && !activity.Stages.Contains(StageNames.ImplementationStarted))
-        {
-            current = "計画のみで、実装開始は記録されていない。";
-            next = string.IsNullOrWhiteSpace(activity.NextAction) ? slice.Next : activity.NextAction;
-        }
-        else if (activity.Stages.Contains(StageNames.ImplementationReportedComplete))
-        {
-            current = "実装完了と報告されている。マージ済みPRは記録されていない。";
-            next = string.IsNullOrWhiteSpace(activity.NextAction) ? slice.Next : activity.NextAction;
-        }
-        else if (activity.Stages.Contains(StageNames.ImplementationStarted))
-        {
-            current = string.IsNullOrWhiteSpace(activity.CurrentPosition) ? "実装開始が記録されている。" : activity.CurrentPosition;
-            next = string.IsNullOrWhiteSpace(activity.NextAction) ? slice.Next : activity.NextAction;
-        }
-        else
-        {
-            current = string.IsNullOrWhiteSpace(activity.CurrentPosition) ? slice.Current : activity.CurrentPosition;
-            next = string.IsNullOrWhiteSpace(activity.NextAction) ? slice.Next : activity.NextAction;
-        }
-
-        return CardParser.RenderWorkstream(slice.Heading, current, next, waiting, references, newline);
-    }
-
-    private static string DescribePull(PullRequestSnapshot pull)
-    {
-        var when = pull.MergedAt?.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture);
-        return pull.State switch
-        {
-            PullRequestState.Merged => pull.Url + " はマージ済み" + (when is null ? "。" : "（" + when + "）。"),
-            PullRequestState.Open => pull.Url + " は未マージ。",
-            _ => pull.Url + " は未マージのClose。",
+            RelativePath = card.RelativePath,
+            BlobBefore = "",
+            NewText = updated,
+            Decisions = decisions,
+            Pulls = pullStates.Select(pair => new ProposalPull(pair.Key, pair.Value)).ToList(),
         };
+    }
+
+    internal static bool CanDelete(IReadOnlyList<ThreadView> reports)
+    {
+        if (reports.Count == 0)
+        {
+            return false;
+        }
+
+        if (reports.Any(report => !string.IsNullOrWhiteSpace(report.Assessment?.ExplicitRemainingWork)))
+        {
+            return false;
+        }
+
+        var latest = Latest(reports);
+        return latest is not null &&
+            latest.Pulls.Count > 0 &&
+            latest.Pulls.All(pull => pull.State == PullRequestState.Merged);
+    }
+
+    private static IReadOnlyList<ThreadView> Relevant(WorkstreamSlice slice, IReadOnlyList<ThreadView> reports)
+    {
+        var linked = reports.Where(report => report.Pulls.Any(pull => slice.Raw.Contains(pull.Url, StringComparison.OrdinalIgnoreCase))).ToList();
+        return linked.Count > 0 ? linked : reports;
+    }
+
+    private static ThreadView? Latest(IReadOnlyList<ThreadView> reports) =>
+        reports.OrderByDescending(report => report.Thread.Response?.Timestamp ?? DateTimeOffset.MinValue).FirstOrDefault();
+
+    private static string LatestActivity(IReadOnlyList<ThreadView> reports)
+    {
+        var latest = Latest(reports);
+        return latest is null ? "" : latest.Thread.Source + ":" + latest.Thread.NativeId;
+    }
+
+    private static string FirstText(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim();
+            }
+        }
+
+        return "";
     }
 
     private static string AppendUrls(string existing, IEnumerable<string> urls, string newline)
@@ -519,75 +502,6 @@ internal static class LedgerPlanner
         }
 
         return text;
-    }
-
-    private static async Task<(ProjectCard? Card, WorkstreamSlice? Workstream, HoldNote? Hold)> MatchAsync(
-        ActivityView activity,
-        IReadOnlyList<ProjectCard> cards,
-        StateStore store,
-        IActivityModel model,
-        CancellationToken cancellationToken)
-    {
-        var urls = activity.PullRequests.Select(pull => pull.Url).Concat(activity.IssueRefs.Select(issue => issue.Url)).Where(url => url.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var urlCards = cards.Where(card => urls.Any(url => card.Text.Contains(url, StringComparison.OrdinalIgnoreCase))).ToList();
-        ProjectCard? card = null;
-        if (urlCards.Count == 1)
-        {
-            card = urlCards[0];
-        }
-        else if (urlCards.Count > 1)
-        {
-            return (null, null, new HoldNote { ActivityId = activity.Id, Reason = "IssueまたはPRのURLが複数のProjectカードに現れている。" });
-        }
-        else if (!string.IsNullOrWhiteSpace(activity.Repository))
-        {
-            var repoCards = cards.Where(candidate => candidate.Repositories.Contains(activity.Repository, StringComparer.OrdinalIgnoreCase)).ToList();
-            if (repoCards.Count == 1)
-            {
-                card = repoCards[0];
-            }
-            else
-            {
-                return (null, null, new HoldNote { ActivityId = activity.Id, Reason = "repositoryに一致するProjectカードを一意に決められない。" });
-            }
-        }
-        else
-        {
-            return (null, null, new HoldNote { ActivityId = activity.Id, Reason = "repositoryもURLも一致しない。" });
-        }
-
-        var referenced = card.Workstreams.Where(workstream => urls.Any(url => workstream.Raw.Contains(url, StringComparison.OrdinalIgnoreCase))).ToList();
-        if (referenced.Count == 0 && store.HasDeleteDecision(activity.Id, card.RelativePath))
-        {
-            return (null, null, null);
-        }
-
-        WorkstreamSlice? slice = referenced.Count == 1 ? referenced[0] : null;
-        if (slice is null && referenced.Count == 0 && card.Workstreams.Count == 1)
-        {
-            slice = card.Workstreams[0];
-        }
-
-        if (slice is null && card.Workstreams.Count > 1)
-        {
-            var choice = await model.ChooseWorkstreamAsync(new WorkstreamChoiceRequest(activity.Repository, activity.Summary, card.Workstreams.Select(workstream => workstream.Heading).ToList()), cancellationToken);
-            if (!choice.Uncertain && choice.Heading is not null)
-            {
-                slice = card.Workstreams.FirstOrDefault(workstream => workstream.Heading == choice.Heading);
-            }
-        }
-
-        if (slice is null)
-        {
-            if (store.HasDeleteDecision(activity.Id, card.RelativePath))
-            {
-                return (null, null, null);
-            }
-
-            return (null, null, new HoldNote { ActivityId = activity.Id, Reason = "対応するworkstreamを一意に決められない。" });
-        }
-
-        return (card, slice, null);
     }
 }
 

@@ -9,8 +9,8 @@ using System.Text.RegularExpressions;
 internal static partial class Normalize
 {
     internal const int ExcerptLimit = 4000;
-    internal const int PacketCharLimit = 80000;
     internal const int StoredBodyLimit = 200_000;
+    internal const int InputModelVersion = 2;
 
     internal static string Sha256Hex(string text)
     {
@@ -20,16 +20,17 @@ internal static partial class Normalize
 
     internal static string ShortHash(string text) => Sha256Hex(text)[..20];
 
+    internal static string ThreadKey(string source, string nativeId) => source + "\n" + nativeId;
+
     internal static string ObservationId(string path, long ordinal, string kind) =>
         "obs_" + ShortHash(path + "\n" + ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n" + kind);
 
-    internal static string ActivityId(string role, IEnumerable<EvidenceSpan> spans)
+    internal static string SelectionFingerprint(SelectedExcerpt? request, SelectedExcerpt? response)
     {
-        var joined = role + "\n" + string.Join(
-            '\n',
-            spans.Select(span => span.ObservationId + "\n" + span.Start.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n" + span.Length.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n" + span.Quote)
-                .OrderBy(text => text, StringComparer.Ordinal));
-        return "act_" + ShortHash(joined);
+        var joined = InputModelVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + "\n" + (request?.Text ?? "")
+            + "\n" + (response?.Text ?? "");
+        return Sha256Hex(joined);
     }
 
     /// <summary>
@@ -65,6 +66,49 @@ internal static partial class Normalize
         }
 
         return found;
+    }
+
+    /// <summary>
+    /// 選択済み本文の PR URL と、repository が分かっているときの番号表記を候補にする。
+    /// </summary>
+    internal static IReadOnlyList<GitHubRef> PullCandidates(string text, string? repository)
+    {
+        var found = GitHubRefs(text).Where(item => item.Kind == "pull").ToList();
+        var seen = found.Select(item => item.Url).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (Match match in RepoPullPattern().Matches(text))
+        {
+            AddPull(found, seen, match.Groups["owner"].Value, match.Groups["repo"].Value, match.Groups["num"].Value);
+        }
+
+        if (!string.IsNullOrWhiteSpace(repository))
+        {
+            var parts = repository.Split('/', 2);
+            if (parts.Length == 2)
+            {
+                foreach (Match match in HashPullPattern().Matches(text))
+                {
+                    AddPull(found, seen, parts[0], parts[1], match.Groups["num"].Value);
+                }
+            }
+        }
+
+        return found;
+    }
+
+    private static void AddPull(List<GitHubRef> found, HashSet<string> seen, string owner, string repo, string numberText)
+    {
+        if (!int.TryParse(numberText, System.Globalization.CultureInfo.InvariantCulture, out var number))
+        {
+            return;
+        }
+
+        var url = "https://github.com/" + owner + "/" + repo + "/pull/" + number.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (!seen.Add(url))
+        {
+            return;
+        }
+
+        found.Add(new GitHubRef(url, owner, repo, number, "pull"));
     }
 
     internal static IReadOnlyList<string> RunIds(string text)
@@ -232,6 +276,12 @@ internal static partial class Normalize
 
     [GeneratedRegex(@"https://github\.com/(?<owner>[A-Za-z0-9_.-]+)/(?<repo>[A-Za-z0-9_.-]+)/(?<kind>pull|issues)/(?<num>\d+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex GitHubUrlPattern();
+
+    [GeneratedRegex(@"(?<owner>[A-Za-z0-9_.-]+)/(?<repo>[A-Za-z0-9_.-]+)#(?<num>\d+)", RegexOptions.CultureInvariant)]
+    private static partial Regex RepoPullPattern();
+
+    [GeneratedRegex(@"(?:^|\s)#(?<num>\d+)\b", RegexOptions.CultureInvariant)]
+    private static partial Regex HashPullPattern();
 
     [GeneratedRegex(@"\b(?<id>\d{8}T\d{6}Z-[0-9a-fA-F]{8})\b", RegexOptions.CultureInvariant)]
     private static partial Regex RunIdPattern();

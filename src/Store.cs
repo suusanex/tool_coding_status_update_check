@@ -34,6 +34,7 @@ internal sealed class StateStore : IDisposable
               cwd TEXT,
               last_event_utc TEXT,
               terminal INTEGER NOT NULL,
+              scan_version INTEGER NOT NULL DEFAULT 0,
               updated_utc TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS observations (
@@ -107,7 +108,37 @@ internal sealed class StateStore : IDisposable
               report_path TEXT,
               proposal_path TEXT
             );
+            CREATE TABLE IF NOT EXISTS meta (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS threads (
+              source TEXT NOT NULL,
+              native_id TEXT NOT NULL,
+              file_path TEXT NOT NULL,
+              repository TEXT,
+              cwd TEXT,
+              request_text TEXT,
+              request_at TEXT,
+              request_ordinal INTEGER,
+              request_basis TEXT,
+              response_text TEXT,
+              response_at TEXT,
+              response_ordinal INTEGER,
+              response_basis TEXT,
+              first_event_utc TEXT,
+              last_event_utc TEXT,
+              fingerprint TEXT NOT NULL,
+              assessment_json TEXT,
+              matched_path TEXT,
+              matched_workstream TEXT,
+              reconcile_fingerprint TEXT,
+              input_version INTEGER NOT NULL,
+              PRIMARY KEY (source, native_id)
+            );
             """);
+        EnsureColumn("files", "scan_version", "INTEGER NOT NULL DEFAULT 0");
+        SetMeta("input_model_version", Normalize.InputModelVersion.ToString(CultureInfo.InvariantCulture));
     }
 
     public FileCursor? GetCursor(string path)
@@ -115,7 +146,7 @@ internal sealed class StateStore : IDisposable
         lock (_gate)
         {
             using var command = _connection.CreateCommand();
-            command.CommandText = "SELECT byte_offset, size, prefix_hash, next_line, native_id, repository, cwd, last_event_utc, terminal FROM files WHERE path = $path";
+            command.CommandText = "SELECT byte_offset, size, prefix_hash, next_line, native_id, repository, cwd, last_event_utc, terminal, scan_version FROM files WHERE path = $path";
             command.Parameters.AddWithValue("$path", path);
             using var reader = command.ExecuteReader();
             if (!reader.Read())
@@ -134,6 +165,7 @@ internal sealed class StateStore : IDisposable
                 Cwd = reader.IsDBNull(6) ? null : reader.GetString(6),
                 LastEventUtc = reader.IsDBNull(7) ? null : ParseTime(reader.GetString(7)),
                 Terminal = reader.GetInt64(8) != 0,
+                ScanVersion = reader.IsDBNull(9) ? 0 : reader.GetInt32(9),
             };
         }
     }
@@ -144,8 +176,8 @@ internal sealed class StateStore : IDisposable
         {
             using var command = _connection.CreateCommand();
             command.CommandText = """
-                INSERT INTO files(path, source, byte_offset, size, prefix_hash, next_line, native_id, repository, cwd, last_event_utc, terminal, updated_utc)
-                VALUES ($path, $source, $offset, $size, $hash, $line, $native, $repo, $cwd, $last, $terminal, $updated)
+                INSERT INTO files(path, source, byte_offset, size, prefix_hash, next_line, native_id, repository, cwd, last_event_utc, terminal, scan_version, updated_utc)
+                VALUES ($path, $source, $offset, $size, $hash, $line, $native, $repo, $cwd, $last, $terminal, $version, $updated)
                 ON CONFLICT(path) DO UPDATE SET
                   source = excluded.source,
                   byte_offset = excluded.byte_offset,
@@ -157,6 +189,7 @@ internal sealed class StateStore : IDisposable
                   cwd = excluded.cwd,
                   last_event_utc = excluded.last_event_utc,
                   terminal = excluded.terminal,
+                  scan_version = excluded.scan_version,
                   updated_utc = excluded.updated_utc
                 """;
             command.Parameters.AddWithValue("$path", path);
@@ -170,6 +203,7 @@ internal sealed class StateStore : IDisposable
             command.Parameters.AddWithValue("$cwd", (object?)cursor.Cwd ?? DBNull.Value);
             command.Parameters.AddWithValue("$last", cursor.LastEventUtc is null ? DBNull.Value : FormatTime(cursor.LastEventUtc.Value));
             command.Parameters.AddWithValue("$terminal", cursor.Terminal ? 1 : 0);
+            command.Parameters.AddWithValue("$version", cursor.ScanVersion);
             command.Parameters.AddWithValue("$updated", FormatTime(DateTimeOffset.UtcNow));
             command.ExecuteNonQuery();
         }
@@ -267,89 +301,6 @@ internal sealed class StateStore : IDisposable
 
             return found;
         }
-    }
-
-    public void UpsertActivity(ActivityView activity)
-    {
-        lock (_gate)
-        {
-            using var transaction = _connection.BeginTransaction();
-            using (var command = _connection.CreateCommand())
-            {
-                command.Transaction = transaction;
-                command.CommandText = """
-                    INSERT INTO activities(id, native_id, evidence_key, json, replaced_by, updated_utc)
-                    VALUES ($id, $native, $key, $json, NULL, $updated)
-                    ON CONFLICT(id) DO UPDATE SET
-                      native_id = excluded.native_id,
-                      evidence_key = excluded.evidence_key,
-                      json = excluded.json,
-                      replaced_by = NULL,
-                      updated_utc = excluded.updated_utc
-                    """;
-                command.Parameters.AddWithValue("$id", activity.Id);
-                command.Parameters.AddWithValue("$native", (object?)activity.NativeId ?? DBNull.Value);
-                command.Parameters.AddWithValue("$key", activity.Id);
-                command.Parameters.AddWithValue("$json", activity.ToJson());
-                command.Parameters.AddWithValue("$updated", FormatTime(DateTimeOffset.UtcNow));
-                command.ExecuteNonQuery();
-            }
-
-            using (var delete = _connection.CreateCommand())
-            {
-                delete.Transaction = transaction;
-                delete.CommandText = "DELETE FROM activity_evidence WHERE activity_id = $id";
-                delete.Parameters.AddWithValue("$id", activity.Id);
-                delete.ExecuteNonQuery();
-            }
-
-            foreach (var observationId in activity.ObservationIds)
-            {
-                using var link = _connection.CreateCommand();
-                link.Transaction = transaction;
-                link.CommandText = "INSERT INTO activity_evidence(activity_id, observation_id) VALUES ($activity, $observation)";
-                link.Parameters.AddWithValue("$activity", activity.Id);
-                link.Parameters.AddWithValue("$observation", observationId);
-                link.ExecuteNonQuery();
-            }
-
-            transaction.Commit();
-        }
-    }
-
-    public void MarkReplaced(string activityId, string replacedBy)
-    {
-        lock (_gate)
-        {
-            using var command = _connection.CreateCommand();
-            command.CommandText = "UPDATE activities SET replaced_by = $by, updated_utc = $updated WHERE id = $id";
-            command.Parameters.AddWithValue("$by", replacedBy);
-            command.Parameters.AddWithValue("$updated", FormatTime(DateTimeOffset.UtcNow));
-            command.Parameters.AddWithValue("$id", activityId);
-            command.ExecuteNonQuery();
-        }
-    }
-
-    public IReadOnlyList<ActivityView> ListCurrentActivities()
-    {
-        lock (_gate)
-        {
-            using var command = _connection.CreateCommand();
-            command.CommandText = "SELECT json FROM activities WHERE replaced_by IS NULL ORDER BY id";
-            var views = new List<ActivityView>();
-            using var reader = command.ExecuteReader();
-            while (reader.Read())
-            {
-                views.Add(ActivityView.FromJson(reader.GetString(0), false));
-            }
-
-            return views;
-        }
-    }
-
-    public IReadOnlyList<ActivityView> ListCurrentByNative(string nativeId)
-    {
-        return ListCurrentActivities().Where(activity => string.Equals(activity.NativeId, nativeId, StringComparison.Ordinal)).ToList();
     }
 
     public void UpsertPull(PullRequestSnapshot snapshot, string? activityId)
@@ -535,9 +486,141 @@ internal sealed class StateStore : IDisposable
         }
     }
 
+    public void UpsertThread(ThreadRecord thread)
+    {
+        lock (_gate)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO threads(
+                  source, native_id, file_path, repository, cwd,
+                  request_text, request_at, request_ordinal, request_basis,
+                  response_text, response_at, response_ordinal, response_basis,
+                  first_event_utc, last_event_utc, fingerprint, assessment_json,
+                  matched_path, matched_workstream, reconcile_fingerprint, input_version)
+                VALUES (
+                  $source, $native, $path, $repo, $cwd,
+                  $request, $requestAt, $requestOrdinal, $requestBasis,
+                  $response, $responseAt, $responseOrdinal, $responseBasis,
+                  $first, $last, $fingerprint, $assessment,
+                  $matchedPath, $matchedWorkstream, $reconcile, $version)
+                ON CONFLICT(source, native_id) DO UPDATE SET
+                  file_path = excluded.file_path,
+                  repository = excluded.repository,
+                  cwd = excluded.cwd,
+                  request_text = excluded.request_text,
+                  request_at = excluded.request_at,
+                  request_ordinal = excluded.request_ordinal,
+                  request_basis = excluded.request_basis,
+                  response_text = excluded.response_text,
+                  response_at = excluded.response_at,
+                  response_ordinal = excluded.response_ordinal,
+                  response_basis = excluded.response_basis,
+                  first_event_utc = excluded.first_event_utc,
+                  last_event_utc = excluded.last_event_utc,
+                  fingerprint = excluded.fingerprint,
+                  assessment_json = excluded.assessment_json,
+                  matched_path = excluded.matched_path,
+                  matched_workstream = excluded.matched_workstream,
+                  reconcile_fingerprint = excluded.reconcile_fingerprint,
+                  input_version = excluded.input_version
+                """;
+            BindThread(command, thread);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    public ThreadRecord? GetThread(string source, string nativeId)
+    {
+        lock (_gate)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = ThreadSelect + " WHERE source = $source AND native_id = $native";
+            command.Parameters.AddWithValue("$source", source);
+            command.Parameters.AddWithValue("$native", nativeId);
+            using var reader = command.ExecuteReader();
+            return reader.Read() ? ReadThread(reader) : null;
+        }
+    }
+
+    public IReadOnlyList<ThreadRecord> ListThreads()
+    {
+        lock (_gate)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = ThreadSelect + " ORDER BY source, native_id";
+            var found = new List<ThreadRecord>();
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                found.Add(ReadThread(reader));
+            }
+
+            return found;
+        }
+    }
+
+    public void SaveAssessment(string source, string nativeId, ThreadAssessment assessment, string? matchedPath, string? matchedWorkstream, string? reconcileFingerprint)
+    {
+        lock (_gate)
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = """
+                UPDATE threads
+                SET assessment_json = $assessment,
+                    matched_path = $path,
+                    matched_workstream = $workstream,
+                    reconcile_fingerprint = $reconcile
+                WHERE source = $source AND native_id = $native
+                """;
+            command.Parameters.AddWithValue("$assessment", assessment.ToJson());
+            command.Parameters.AddWithValue("$path", (object?)matchedPath ?? DBNull.Value);
+            command.Parameters.AddWithValue("$workstream", (object?)matchedWorkstream ?? DBNull.Value);
+            command.Parameters.AddWithValue("$reconcile", (object?)reconcileFingerprint ?? DBNull.Value);
+            command.Parameters.AddWithValue("$source", source);
+            command.Parameters.AddWithValue("$native", nativeId);
+            command.ExecuteNonQuery();
+        }
+    }
+
     public void Dispose()
     {
         _connection.Dispose();
+    }
+
+    private void SetMeta(string key, string value)
+    {
+        using var command = _connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO meta(key, value) VALUES ($key, $value)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """;
+        command.Parameters.AddWithValue("$key", key);
+        command.Parameters.AddWithValue("$value", value);
+        command.ExecuteNonQuery();
+    }
+
+    private void EnsureColumn(string table, string column, string definition)
+    {
+        var exists = false;
+        using (var command = _connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA table_info(" + table + ")";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                {
+                    exists = true;
+                    break;
+                }
+            }
+        }
+
+        if (!exists)
+        {
+            Execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+        }
     }
 
     private void Execute(string sql)
@@ -635,6 +718,75 @@ internal sealed class StateStore : IDisposable
         return values;
     }
 
+    private const string ThreadSelect = """
+        SELECT source, native_id, file_path, repository, cwd,
+               request_text, request_at, request_ordinal, request_basis,
+               response_text, response_at, response_ordinal, response_basis,
+               first_event_utc, last_event_utc, fingerprint, assessment_json,
+               matched_path, matched_workstream, reconcile_fingerprint, input_version
+        FROM threads
+        """;
+
+    private static void BindThread(SqliteCommand command, ThreadRecord thread)
+    {
+        command.Parameters.AddWithValue("$source", thread.Source);
+        command.Parameters.AddWithValue("$native", thread.NativeId);
+        command.Parameters.AddWithValue("$path", thread.FilePath);
+        command.Parameters.AddWithValue("$repo", (object?)thread.Repository ?? DBNull.Value);
+        command.Parameters.AddWithValue("$cwd", (object?)thread.Cwd ?? DBNull.Value);
+        command.Parameters.AddWithValue("$request", (object?)thread.Request?.Text ?? DBNull.Value);
+        command.Parameters.AddWithValue("$requestAt", thread.Request?.Timestamp is null ? DBNull.Value : FormatTime(thread.Request.Timestamp.Value));
+        command.Parameters.AddWithValue("$requestOrdinal", thread.Request is null ? DBNull.Value : thread.Request.Ordinal);
+        command.Parameters.AddWithValue("$requestBasis", (object?)thread.Request?.Basis ?? DBNull.Value);
+        command.Parameters.AddWithValue("$response", (object?)thread.Response?.Text ?? DBNull.Value);
+        command.Parameters.AddWithValue("$responseAt", thread.Response?.Timestamp is null ? DBNull.Value : FormatTime(thread.Response.Timestamp.Value));
+        command.Parameters.AddWithValue("$responseOrdinal", thread.Response is null ? DBNull.Value : thread.Response.Ordinal);
+        command.Parameters.AddWithValue("$responseBasis", (object?)thread.Response?.Basis ?? DBNull.Value);
+        command.Parameters.AddWithValue("$first", thread.FirstEventUtc is null ? DBNull.Value : FormatTime(thread.FirstEventUtc.Value));
+        command.Parameters.AddWithValue("$last", thread.LastEventUtc is null ? DBNull.Value : FormatTime(thread.LastEventUtc.Value));
+        command.Parameters.AddWithValue("$fingerprint", thread.Fingerprint);
+        command.Parameters.AddWithValue("$assessment", thread.Assessment is null ? DBNull.Value : thread.Assessment.ToJson());
+        command.Parameters.AddWithValue("$matchedPath", (object?)thread.MatchedPath ?? DBNull.Value);
+        command.Parameters.AddWithValue("$matchedWorkstream", (object?)thread.MatchedWorkstream ?? DBNull.Value);
+        command.Parameters.AddWithValue("$reconcile", (object?)thread.ReconcileFingerprint ?? DBNull.Value);
+        command.Parameters.AddWithValue("$version", Normalize.InputModelVersion);
+    }
+
+    private static ThreadRecord ReadThread(SqliteDataReader reader)
+    {
+        return new ThreadRecord
+        {
+            Source = reader.GetString(0),
+            NativeId = reader.GetString(1),
+            FilePath = reader.GetString(2),
+            Repository = reader.IsDBNull(3) ? null : reader.GetString(3),
+            Cwd = reader.IsDBNull(4) ? null : reader.GetString(4),
+            Request = ReadExcerpt(reader, 5),
+            Response = ReadExcerpt(reader, 9),
+            FirstEventUtc = reader.IsDBNull(13) ? null : ParseTime(reader.GetString(13)),
+            LastEventUtc = reader.IsDBNull(14) ? null : ParseTime(reader.GetString(14)),
+            Fingerprint = reader.GetString(15),
+            Assessment = reader.IsDBNull(16) ? null : ThreadAssessment.FromJson(reader.GetString(16)),
+            MatchedPath = reader.IsDBNull(17) ? null : reader.GetString(17),
+            MatchedWorkstream = reader.IsDBNull(18) ? null : reader.GetString(18),
+            ReconcileFingerprint = reader.IsDBNull(19) ? null : reader.GetString(19),
+        };
+    }
+
+    private static SelectedExcerpt? ReadExcerpt(SqliteDataReader reader, int textOrdinal)
+    {
+        if (reader.IsDBNull(textOrdinal))
+        {
+            return null;
+        }
+
+        var text = reader.GetString(textOrdinal);
+        var at = reader.IsDBNull(textOrdinal + 1) ? (DateTimeOffset?)null : ParseTime(reader.GetString(textOrdinal + 1));
+        var ordinal = reader.IsDBNull(textOrdinal + 2) ? 0 : reader.GetInt64(textOrdinal + 2);
+        var basis = reader.IsDBNull(textOrdinal + 3) ? "" : reader.GetString(textOrdinal + 3);
+        return new SelectedExcerpt(text, at, ordinal, basis);
+    }
+
     internal static string FormatTime(DateTimeOffset value) =>
         value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture);
 
@@ -644,13 +796,14 @@ internal sealed class StateStore : IDisposable
 
 internal sealed class FileCursor
 {
-    public long ByteOffset { get; init; }
-    public long Size { get; init; }
-    public string PrefixHash { get; init; } = "";
-    public long NextLine { get; init; } = 1;
-    public string? NativeId { get; init; }
-    public string? Repository { get; init; }
-    public string? Cwd { get; init; }
-    public DateTimeOffset? LastEventUtc { get; init; }
-    public bool Terminal { get; init; }
+    public long ByteOffset { get; set; }
+    public long Size { get; set; }
+    public string PrefixHash { get; set; } = "";
+    public long NextLine { get; set; } = 1;
+    public string? NativeId { get; set; }
+    public string? Repository { get; set; }
+    public string? Cwd { get; set; }
+    public DateTimeOffset? LastEventUtc { get; set; }
+    public bool Terminal { get; set; }
+    public int ScanVersion { get; set; }
 }

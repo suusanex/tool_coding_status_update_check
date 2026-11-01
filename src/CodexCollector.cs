@@ -1,14 +1,13 @@
 using System.Globalization;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 
 /// <summary>
-/// Codex rollout JSONL から、session_meta と会話・tool の対応だけを抜く。
-/// reasoning の encrypted_content、account id、base_instructions は残さない。
+/// Codex rollout から、最初の実質的なユーザー依頼と最後の final_answer だけを残す。
+/// commentary、ツール引数、ツール結果の本文は選択しない。
 /// </summary>
 internal static class CodexCollector
 {
-    internal static ObservationDraft? ParseLine(string path, ByteLog.LogLine line, ParseCarry carry)
+    internal static void Observe(ByteLog.LogLine line, CodexSelection selection)
     {
         JsonDocument document;
         try
@@ -23,40 +22,62 @@ internal static class CodexCollector
         using (document)
         {
             var root = document.RootElement;
-            var type = StringProp(root, "type");
             var timestamp = ReadTimestamp(root, "timestamp");
-            if (timestamp is not null && (carry.LastEvent is null || timestamp > carry.LastEvent))
+            if (timestamp is not null)
             {
-                carry.LastEvent = timestamp;
+                selection.Note(timestamp.Value);
             }
 
             if (!root.TryGetProperty("payload", out var payload) || payload.ValueKind != JsonValueKind.Object)
             {
-                return null;
+                return;
             }
 
+            var type = StringProp(root, "type");
             if (type == "session_meta")
             {
-                return ParseSession(path, line, payload, timestamp, carry);
+                ReadSession(payload, selection);
+                return;
             }
 
-            var nativeId = carry.NativeId ?? Path.GetFileNameWithoutExtension(path);
-            if (type == "response_item")
+            if (type != "response_item" || StringProp(payload, "type") != "message")
             {
-                return ParseResponse(path, line, payload, timestamp, nativeId, carry);
+                return;
             }
 
-            if (type == "event_msg" && StringProp(payload, "type") == "task_started")
-            {
-                var turnId = StringProp(payload, "turn_id");
-                return Draft(path, line, "codex", nativeId, timestamp, "task_started", "task_started turn_id=" + turnId, new JsonObject { ["turnId"] = turnId }, carry);
-            }
-
-            return null;
+            ReadMessage(payload, line, timestamp, selection);
         }
     }
 
-    private static ObservationDraft ParseSession(string path, ByteLog.LogLine line, JsonElement payload, DateTimeOffset? timestamp, ParseCarry carry)
+    internal static string? SubstantiveUserText(string text)
+    {
+        var trimmed = text.Trim();
+        if (trimmed.Length == 0)
+        {
+            return null;
+        }
+
+        trimmed = StripBlock(trimmed, "environment_context").Trim();
+        if (trimmed.Length == 0)
+        {
+            return null;
+        }
+
+        if (StartsWithBlock(trimmed, "user_instructions") ||
+            StartsWithBlock(trimmed, "permissions") ||
+            StartsWithBlock(trimmed, "sandbox_instructions") ||
+            StartsWithBlock(trimmed, "skill") ||
+            StartsWithBlock(trimmed, "skills") ||
+            trimmed.StartsWith("<external_codex_apps", StringComparison.Ordinal) ||
+            trimmed.StartsWith("# AGENTS.md", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        return trimmed;
+    }
+
+    private static void ReadSession(JsonElement payload, CodexSelection selection)
     {
         var sessionId = StringProp(payload, "session_id");
         if (string.IsNullOrWhiteSpace(sessionId))
@@ -64,125 +85,100 @@ internal static class CodexCollector
             sessionId = StringProp(payload, "id");
         }
 
-        if (string.IsNullOrWhiteSpace(sessionId))
+        if (!string.IsNullOrWhiteSpace(sessionId))
         {
-            sessionId = Path.GetFileNameWithoutExtension(path);
+            selection.NativeId = sessionId;
         }
 
         var cwd = StringProp(payload, "cwd");
-        string? repository = null;
-        string? branch = null;
+        if (!string.IsNullOrWhiteSpace(cwd))
+        {
+            selection.Cwd = cwd;
+        }
+
         if (payload.TryGetProperty("git", out var git) && git.ValueKind == JsonValueKind.Object)
         {
-            repository = Normalize.RepositoryFromGitUrl(StringProp(git, "repository_url"));
-            branch = StringProp(git, "branch");
+            var repository = Normalize.RepositoryFromGitUrl(StringProp(git, "repository_url"));
+            if (!string.IsNullOrWhiteSpace(repository))
+            {
+                selection.Repository = repository;
+            }
         }
-
-        carry.NativeId = sessionId;
-        carry.Cwd = cwd;
-        carry.Repository = repository;
-        var body = "cwd=" + cwd + "\nrepository=" + repository + "\nbranch=" + branch;
-        var detail = new JsonObject
-        {
-            ["cwd"] = cwd,
-            ["repository"] = repository,
-            ["branch"] = branch,
-        };
-        return Draft(path, line, "codex", sessionId, timestamp, "session_meta", body, detail, carry);
     }
 
-    private static ObservationDraft? ParseResponse(string path, ByteLog.LogLine line, JsonElement payload, DateTimeOffset? timestamp, string nativeId, ParseCarry carry)
+    private static void ReadMessage(JsonElement payload, ByteLog.LogLine line, DateTimeOffset? timestamp, CodexSelection selection)
     {
-        var payloadType = StringProp(payload, "type");
-        if (payloadType == "message")
+        var role = StringProp(payload, "role");
+        if (!payload.TryGetProperty("content", out var content))
         {
-            var role = StringProp(payload, "role");
-            if (role is not ("user" or "assistant"))
+            return;
+        }
+
+        var text = Normalize.ReadText(content);
+        if (role == "user")
+        {
+            if (selection.Request is not null)
             {
-                return null;
+                return;
             }
 
-            if (!payload.TryGetProperty("content", out var content))
+            var substantive = SubstantiveUserText(text);
+            if (substantive is null)
             {
-                return null;
+                return;
             }
 
-            var text = Normalize.ReadText(content);
-            if (string.IsNullOrWhiteSpace(text))
-            {
-                return null;
-            }
-
-            var hints = Normalize.ResidualHints(text);
-            var detail = new JsonObject { ["role"] = role, ["hints"] = ToArray(hints) };
-            return Draft(path, line, "codex", nativeId, timestamp, role + "_message", text, detail, carry, text);
+            selection.Request = new SelectedExcerpt(substantive, timestamp, line.Number, "response_item user message");
+            return;
         }
 
-        if (payloadType == "function_call")
+        if (role != "assistant")
         {
-            var name = StringProp(payload, "name");
-            var callId = StringProp(payload, "call_id");
-            var arguments = payload.TryGetProperty("arguments", out var args) ? ElementText(args) : "";
-            var text = "tool " + name + " call_id=" + callId + "\n" + arguments;
-            var detail = new JsonObject { ["name"] = name, ["callId"] = callId, ["hints"] = ToArray(Normalize.ResidualHints(text)) };
-            return Draft(path, line, "codex", nativeId, timestamp, "function_call", text, detail, carry, text);
+            return;
         }
 
-        if (payloadType == "function_call_output")
+        var phase = StringProp(payload, "phase");
+        if (phase.Equals("commentary", StringComparison.OrdinalIgnoreCase))
         {
-            var callId = StringProp(payload, "call_id");
-            var output = payload.TryGetProperty("output", out var outputElement) ? ElementText(outputElement) : "";
-            var text = "tool_result call_id=" + callId + "\n" + output;
-            var detail = new JsonObject { ["callId"] = callId, ["hints"] = ToArray(Normalize.ResidualHints(text)) };
-            return Draft(path, line, "codex", nativeId, timestamp, "function_call_output", text, detail, carry, text);
+            return;
         }
 
-        return null;
+        if (phase.Length > 0 && !phase.Equals("final_answer", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var answer = text.Trim();
+        if (answer.Length == 0)
+        {
+            return;
+        }
+
+        selection.Response = new SelectedExcerpt(answer, timestamp, line.Number, phase.Length == 0 ? "response_item assistant message" : "response_item final_answer");
     }
 
-    private static ObservationDraft Draft(string path, ByteLog.LogLine line, string source, string nativeId, DateTimeOffset? timestamp, string kind, string body, JsonObject detail, ParseCarry carry, string? urlSource = null)
+    private static string StripBlock(string text, string name)
     {
-        var sourceText = urlSource ?? body;
-        if (sourceText.Length > Normalize.StoredBodyLimit)
+        var open = "<" + name + ">";
+        var close = "</" + name + ">";
+        var start = text.IndexOf(open, StringComparison.Ordinal);
+        if (start < 0)
         {
-            sourceText = sourceText[..Normalize.StoredBodyLimit];
+            return text;
         }
 
-        var stored = Normalize.StoreBody(body, out var omittedTail);
-        if (omittedTail)
+        var end = text.IndexOf(close, start, StringComparison.Ordinal);
+        if (end < 0)
         {
-            detail["omittedTail"] = true;
+            return text;
         }
 
-        detail["hints"] ??= ToArray(Normalize.ResidualHints(sourceText));
-        return new ObservationDraft
-        {
-            Source = source,
-            NativeId = nativeId,
-            FilePath = path,
-            Ordinal = line.Number,
-            Timestamp = timestamp,
-            Kind = kind,
-            Body = stored,
-            DetailJson = detail.ToJsonString(),
-            Urls = Normalize.GitHubRefs(sourceText),
-            RunIds = Normalize.RunIds(sourceText),
-        };
+        return text.Remove(start, end + close.Length - start);
     }
 
-    private static JsonArray ToArray(IReadOnlyList<string> values)
-    {
-        var array = new JsonArray();
-        foreach (var value in values)
-        {
-            JsonLists.AddText(array, value);
-        }
-
-        return array;
-    }
-
-    private static string ElementText(JsonElement element) =>
-        element.ValueKind == JsonValueKind.String ? element.GetString() ?? "" : element.GetRawText();
+    private static bool StartsWithBlock(string text, string name) =>
+        text.StartsWith("<" + name + ">", StringComparison.Ordinal) ||
+        text.StartsWith("<" + name + " ", StringComparison.Ordinal);
 
     private static string StringProp(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
@@ -199,11 +195,26 @@ internal static class CodexCollector
     }
 }
 
-internal sealed class ParseCarry
+internal sealed class CodexSelection
 {
     public string? NativeId { get; set; }
     public string? Repository { get; set; }
     public string? Cwd { get; set; }
+    public SelectedExcerpt? Request { get; set; }
+    public SelectedExcerpt? Response { get; set; }
+    public DateTimeOffset? FirstEvent { get; set; }
     public DateTimeOffset? LastEvent { get; set; }
-    public bool Terminal { get; set; }
+
+    public void Note(DateTimeOffset timestamp)
+    {
+        if (FirstEvent is null || timestamp < FirstEvent)
+        {
+            FirstEvent = timestamp;
+        }
+
+        if (LastEvent is null || timestamp > LastEvent)
+        {
+            LastEvent = timestamp;
+        }
+    }
 }

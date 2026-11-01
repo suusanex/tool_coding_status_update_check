@@ -1,7 +1,7 @@
 using System.Text;
 
 /// <summary>
-/// 日本語の活動レポート。期間中の変化と、照会時刻のPR状態を分けて書く。
+/// 採用した依頼と最後の通常応答だけを書く。期間内の全作業を復元したとは書かない。
 /// </summary>
 internal static class ReportWriter
 {
@@ -12,49 +12,23 @@ internal static class ReportWriter
         builder.AppendLine();
         builder.AppendLine("- 期間: " + model.Window.FromDate.ToString("yyyy-MM-dd") + " から " + model.Window.ToDate.ToString("yyyy-MM-dd") + " （タイムゾーン: " + model.Window.TimeZoneId + "）");
         builder.AppendLine("- 照会時刻: " + StateStore.FormatTime(model.QueriedAt));
-        builder.AppendLine("- 収集対象: Codex rollout と CodexAgentFacade の events.jsonl");
+        builder.AppendLine("- 収集対象: Codex rollout。CodexAgentFacade の events.jsonl は読まない。");
+        builder.AppendLine("- 各スレッドからは、最初の実質的な依頼と最後の通常応答だけを採用した。期間内の全作業を復元したものではない。");
         builder.AppendLine("- ChatGPT Chat の履歴は収集していない。");
         builder.AppendLine();
-        builder.AppendLine("## 読めなかったログ");
+        AppendSkips(builder, model.SkippedLogs);
+        builder.AppendLine("## 採用した報告");
         builder.AppendLine();
-        if (model.SkippedLogs.Count == 0)
+        var reported = model.Threads.Where(view => view.Thread.HasResponse).ToList();
+        if (reported.Count == 0)
         {
-            builder.AppendLine("なし。");
-        }
-        else
-        {
-            foreach (var skip in model.SkippedLogs)
-            {
-                builder.AppendLine("- " + skip.ToReport());
-            }
-        }
-
-        builder.AppendLine();
-        builder.AppendLine("## 活動");
-        builder.AppendLine();
-        foreach (var activity in model.Activities.Where(activity => activity.Kind != "status_check_self"))
-        {
-            AppendActivity(builder, activity, model.Window);
-        }
-
-        if (model.Activities.All(activity => activity.Kind == "status_check_self"))
-        {
-            builder.AppendLine("期間内の対象活動はない。");
+            builder.AppendLine("通常応答のある対象スレッドはない。");
             builder.AppendLine();
         }
 
-        builder.AppendLine("## このツール自身の実行");
-        builder.AppendLine();
-        var self = model.Activities.Where(activity => activity.Kind == "status_check_self").ToList();
-        if (self.Count == 0)
+        foreach (var view in reported)
         {
-            builder.AppendLine("なし。");
-            builder.AppendLine();
-        }
-
-        foreach (var activity in self)
-        {
-            AppendActivity(builder, activity, model.Window);
+            AppendThread(builder, view, model.Window);
         }
 
         builder.AppendLine("## 保留");
@@ -72,21 +46,6 @@ internal static class ReportWriter
         }
 
         builder.AppendLine();
-        builder.AppendLine("## 集中した活動");
-        builder.AppendLine();
-        if (model.Concentrations.Count == 0)
-        {
-            builder.AppendLine("観測された集中先はない。");
-        }
-        else
-        {
-            foreach (var item in model.Concentrations.Take(10))
-            {
-                builder.AppendLine("- " + item.Title + "（" + item.ActivityId + "）: " + item.Reason);
-            }
-        }
-
-        builder.AppendLine();
         builder.AppendLine("## 台帳");
         builder.AppendLine();
         builder.AppendLine(model.LedgerSummary);
@@ -100,35 +59,91 @@ internal static class ReportWriter
         return builder.ToString();
     }
 
-    private static void AppendActivity(StringBuilder builder, ActivityView activity, TimeWindow window)
+    internal static string WriteEstimate(TimeWindow window, DateTimeOffset queriedAt, EstimateReport estimate, IReadOnlyList<IngestSkip> skips)
     {
-        builder.AppendLine("### " + activity.Summary);
+        var builder = new StringBuilder();
+        builder.AppendLine("# 送信量の推定");
         builder.AppendLine();
-        builder.AppendLine("- repository: " + (string.IsNullOrWhiteSpace(activity.Repository) ? "不明" : activity.Repository));
-        builder.AppendLine("- 段階: " + (activity.Stages.Count == 0 ? "不明" : string.Join("、", activity.Stages.Select(StageNames.Label))));
-        builder.AppendLine("- 期間中の変化: " + (activity.InWindow ? activity.PeriodChange : "窓内のログ追記はない。"));
-        builder.AppendLine("- 現在地: " + activity.CurrentPosition);
-        builder.AppendLine("- 照会時点のPR: " + PullSummary(activity));
-        builder.AppendLine("- マージ時刻と期間: " + MergeTiming(activity, window));
-        builder.AppendLine("- 根拠: " + string.Join("、", activity.Evidence));
-        builder.AppendLine("- 不確実さ: " + (string.IsNullOrWhiteSpace(activity.Uncertainty) ? "記録なし" : activity.Uncertainty));
-        builder.AppendLine("- 確信度: " + activity.Confidence.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
-        if (!string.IsNullOrWhiteSpace(activity.DiscoveredFrom))
+        builder.AppendLine("APIは呼び出していない。これは llm_usage の実績ではない。出力トークンは推定していない。途中ログは送信対象に含めていない。");
+        builder.AppendLine();
+        builder.AppendLine("- 期間: " + window.FromDate.ToString("yyyy-MM-dd") + " から " + window.ToDate.ToString("yyyy-MM-dd") + " （タイムゾーン: " + window.TimeZoneId + "）");
+        builder.AppendLine("- 照会時刻: " + StateStore.FormatTime(queriedAt));
+        builder.AppendLine("- 対象スレッド: " + estimate.Threads.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- 通常応答あり: " + estimate.WithResponse.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- 通常応答なし: " + estimate.WithoutResponse.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- 最初の依頼の文字数: " + estimate.RequestChars.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- 最後の応答の文字数: " + estimate.ResponseChars.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- assess 呼び出し: " + estimate.AssessCalls.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- reconcile 呼び出し: " + estimate.ReconcileCalls.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- payload 文字数: " + estimate.PayloadChars.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- 入力トークン推定: " + estimate.InputTokens.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        builder.AppendLine("- 入力トークン推定は文字数を4で割った値であり、出力は含まない。");
+        builder.AppendLine("- 途中ログがpayloadに含まれる: " + (estimate.PayloadContainsToolUpdates ? "はい" : "いいえ"));
+        builder.AppendLine();
+        AppendSkips(builder, skips);
+        builder.AppendLine("## 採用した応答");
+        builder.AppendLine();
+        foreach (var thread in estimate.Selected.Where(thread => thread.HasResponse))
         {
-            builder.AppendLine("- 発見元: " + activity.DiscoveredFrom);
+            builder.AppendLine("- " + thread.Source + ":" + thread.NativeId + " 応答 " + Format(thread.Response?.Timestamp) + " / " + (thread.Response?.Text.Length ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture) + "文字");
+        }
+
+        return builder.ToString();
+    }
+
+    private static void AppendSkips(StringBuilder builder, IReadOnlyList<IngestSkip> skips)
+    {
+        builder.AppendLine("## 読めなかったログ");
+        builder.AppendLine();
+        if (skips.Count == 0)
+        {
+            builder.AppendLine("なし。");
+        }
+        else
+        {
+            foreach (var skip in skips)
+            {
+                builder.AppendLine("- " + skip.ToReport());
+            }
         }
 
         builder.AppendLine();
     }
 
-    private static string PullSummary(ActivityView activity)
+    private static void AppendThread(StringBuilder builder, ThreadView view, TimeWindow window)
     {
-        if (activity.PullRequests.Count == 0)
+        var thread = view.Thread;
+        var summary = string.IsNullOrWhiteSpace(view.Assessment?.Summary) ? thread.NativeId : view.Assessment!.Summary;
+        builder.AppendLine("### " + summary);
+        builder.AppendLine();
+        builder.AppendLine("- id: " + thread.Source + ":" + thread.NativeId);
+        builder.AppendLine("- repository: " + (string.IsNullOrWhiteSpace(thread.Repository) ? "不明" : thread.Repository));
+        builder.AppendLine("- 最初の依頼: " + Format(thread.Request?.Timestamp) + " / " + (thread.Request?.Basis ?? ""));
+        builder.AppendLine("- 採用した応答: " + Format(thread.Response?.Timestamp) + " / " + (thread.Response?.Basis ?? ""));
+        builder.AppendLine("- 現在地: " + (string.IsNullOrWhiteSpace(view.Assessment?.CurrentPosition) ? "記録なし" : view.Assessment!.CurrentPosition));
+        builder.AppendLine("- 明示的な残作業: " + (string.IsNullOrWhiteSpace(view.Assessment?.ExplicitRemainingWork) ? "なし" : view.Assessment!.ExplicitRemainingWork));
+        builder.AppendLine("- 照会時点のPR: " + PullSummary(view));
+        foreach (var line in MergeTiming(view, window))
+        {
+            builder.AppendLine("- " + line);
+        }
+
+        if (!string.IsNullOrWhiteSpace(view.Assessment?.Uncertainty))
+        {
+            builder.AppendLine("- 不確実さ: " + view.Assessment.Uncertainty);
+        }
+
+        builder.AppendLine();
+    }
+
+    private static string PullSummary(ThreadView view)
+    {
+        if (view.Pulls.Count == 0)
         {
             return "なし";
         }
 
-        return string.Join("、", activity.PullRequests.Select(pull => pull.Url + " は " + (pull.State switch
+        return string.Join("、", view.Pulls.Select(pull => pull.Url + " は " + (pull.State switch
         {
             PullRequestState.Merged => "マージ済み",
             PullRequestState.Open => "未マージ",
@@ -136,27 +151,26 @@ internal static class ReportWriter
         })));
     }
 
-    private static string MergeTiming(ActivityView activity, TimeWindow window)
+    private static IEnumerable<string> MergeTiming(ThreadView view, TimeWindow window)
     {
-        var merged = activity.PullRequests.Where(pull => pull.State == PullRequestState.Merged && pull.MergedAt is not null).ToList();
-        if (merged.Count == 0)
+        foreach (var pull in view.Pulls.Where(pull => pull.State == PullRequestState.Merged && pull.MergedAt is not null))
         {
-            return "照会時点で期間内のマージ時刻は取れていない。";
+            yield return window.Contains(pull.MergedAt!.Value)
+                ? pull.Url + " のマージ時刻は期間内。"
+                : pull.Url + " のマージ時刻は期間外。";
         }
-
-        return string.Join(" ", merged.Select(pull => window.Contains(pull.MergedAt!.Value)
-            ? pull.Url + " のマージ時刻は期間内。"
-            : pull.Url + " のマージ時刻は期間外のため、期間中の成果には含めない。"));
     }
+
+    private static string Format(DateTimeOffset? timestamp) =>
+        timestamp is null ? "不明" : StateStore.FormatTime(timestamp.Value);
 }
 
 internal sealed class ReportModel
 {
     public required TimeWindow Window { get; init; }
     public required DateTimeOffset QueriedAt { get; init; }
-    public required IReadOnlyList<ActivityView> Activities { get; init; }
+    public required IReadOnlyList<ThreadView> Threads { get; init; }
     public required IReadOnlyList<HoldNote> Holds { get; init; }
-    public required IReadOnlyList<ConcentrationItem> Concentrations { get; init; }
     public required string LedgerSummary { get; init; }
     public required int InputTokens { get; init; }
     public required int OutputTokens { get; init; }

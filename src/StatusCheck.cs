@@ -9,10 +9,8 @@
 #:include ByteLog.cs
 #:include Store.cs
 #:include CodexCollector.cs
-#:include FacadeCollector.cs
 #:include GitHubClient.cs
 #:include OpenAiActivity.cs
-#:include ActivityGrouping.cs
 #:include Ledger.cs
 #:include Report.cs
 #:include Pipeline.cs
@@ -20,7 +18,7 @@
 Environment.ExitCode = await Cli.RunAsync(args);
 
 /// <summary>
-/// run / preview / apply の入口。APIキーは OPENAI_API_KEY_STATUS_CHECK だけを読む。
+/// run / preview / apply / estimate の入口。APIキーは OPENAI_API_KEY_STATUS_CHECK だけを読む。
 /// </summary>
 internal static class Cli
 {
@@ -30,7 +28,7 @@ internal static class Cli
         {
             if (args.Length == 0 || args[0] is "-h" or "--help")
             {
-                Console.Error.WriteLine("Usage: dotnet run --file src/StatusCheck.cs -- run|preview|apply [options]");
+                Console.Error.WriteLine("Usage: dotnet run --file src/StatusCheck.cs -- run|preview|apply|estimate [options]");
                 return args.Length == 0 ? 1 : 0;
             }
 
@@ -50,28 +48,33 @@ internal static class Cli
                 return applied.ExitCode;
             }
 
-            if (command is not ("run" or "preview"))
+            if (command is not ("run" or "preview" or "estimate"))
             {
                 throw new StatusCheckException("Unknown command: " + command);
             }
 
-            var key = AppConfig.ReadApiKey();
-            if (key is null)
+            var estimate = command == "estimate";
+            string? key = null;
+            if (!estimate)
             {
-                throw new StatusCheckException("OPENAI_API_KEY_STATUS_CHECK is not set.");
+                key = AppConfig.ReadApiKey();
+                if (key is null)
+                {
+                    throw new StatusCheckException("OPENAI_API_KEY_STATUS_CHECK is not set.");
+                }
             }
 
             var window = BuildWindow(options);
             var runId = Guid.NewGuid().ToString("D");
             using var store = new StateStore(config.DatabasePath);
-            var model = new OpenAiActivityModel(key, config.Model, config.ReasoningEffort, config.MaxRetries, options.MaxUsd, store, runId);
             var result = await StatusPipeline.RunAsync(new RunRequest
             {
                 Config = config,
                 Window = window,
                 ApplyLedger = command == "run",
-                Model = model,
-                Pulls = new GhPullRequestSource(),
+                EstimateOnly = estimate,
+                Model = estimate ? null : new OpenAiActivityModel(key!, config.Model, config.ReasoningEffort, config.MaxRetries, options.MaxUsd, store, runId),
+                Pulls = estimate ? null : new GhPullRequestSource(),
                 Store = store,
                 Now = DateTimeOffset.UtcNow,
                 RunId = runId,
@@ -98,13 +101,23 @@ internal static class Cli
             Console.WriteLine("report: " + result.ReportPath);
         }
 
+        if (result.Estimated)
+        {
+            Console.WriteLine("estimated input tokens: " + result.EstimatedInputTokens.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Console.WriteLine("planned calls: " + result.PlannedCalls.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            Console.WriteLine("api calls: 0");
+        }
+
         if (result.StopReason is not null)
         {
             Console.WriteLine("stopped: " + result.StopReason);
             return;
         }
 
-        Console.WriteLine(result.AppliedCards.Count == 0 ? "applied: none" : "applied: " + string.Join(", ", result.AppliedCards));
+        if (!result.Estimated)
+        {
+            Console.WriteLine(result.AppliedCards.Count == 0 ? "applied: none" : "applied: " + string.Join(", ", result.AppliedCards));
+        }
     }
 
     private static TimeWindow BuildWindow(CliOptions options)
