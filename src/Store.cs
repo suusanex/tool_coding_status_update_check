@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Data.Sqlite;
 
@@ -785,11 +786,26 @@ internal sealed class StateStore : IDisposable
             FirstEventUtc = reader.IsDBNull(13) ? null : ParseTime(reader.GetString(13)),
             LastEventUtc = reader.IsDBNull(14) ? null : ParseTime(reader.GetString(14)),
             Fingerprint = reader.GetString(15),
-            Assessment = reader.IsDBNull(16) ? null : ThreadAssessment.FromJson(reader.GetString(16)),
+            Assessment = reader.IsDBNull(16) ? null : ReadAssessment(reader.GetString(16)),
             MatchedPath = reader.IsDBNull(17) ? null : reader.GetString(17),
             MatchedWorkstream = reader.IsDBNull(18) ? null : reader.GetString(18),
             ReconcileFingerprint = reader.IsDBNull(19) ? null : reader.GetString(19),
         };
+    }
+
+    /// <summary>
+    /// 保存済み評価が壊れていても、そのスレッドだけ未評価に戻して他の行は読む。
+    /// </summary>
+    private static ThreadAssessment? ReadAssessment(string json)
+    {
+        try
+        {
+            return ThreadAssessment.FromJson(json);
+        }
+        catch (Exception ex) when (ex is StatusCheckException or JsonException or InvalidOperationException)
+        {
+            return null;
+        }
     }
 
     private static SelectedExcerpt? ReadExcerpt(SqliteDataReader reader, int textOrdinal)

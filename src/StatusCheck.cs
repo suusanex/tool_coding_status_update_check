@@ -96,6 +96,11 @@ internal static class Cli
             Console.Error.WriteLine(skip.ToLog());
         }
 
+        foreach (var skip in result.SkippedRecords)
+        {
+            Console.Error.WriteLine(skip.ToLog());
+        }
+
         if (!string.IsNullOrWhiteSpace(result.ReportPath))
         {
             Console.WriteLine("report: " + result.ReportPath);

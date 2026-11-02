@@ -55,7 +55,7 @@ internal sealed class OpenAiActivityModel : IActivityModel
         {
             if (_maxUsd is not null && (_spent >= _maxUsd.Value || _spent + projected > _maxUsd.Value))
             {
-                throw new StatusCheckException("Estimated spend reached --max-usd before the next model call.");
+                throw new StatusCheckException("Estimated spend reached --max-usd before the next model call.", fatal: true);
             }
 
             if (_maxUsd is not null)
@@ -328,42 +328,64 @@ internal static class ThreadPrompts
 
     internal static ThreadAssessment ParseAssessment(string json)
     {
-        var obj = JsonNode.Parse(json) as JsonObject ?? throw new StatusCheckException("Assessment JSON is not an object.");
-        return new ThreadAssessment
+        try
         {
-            Summary = obj["summary"]?.GetValue<string>() ?? "",
-            Purpose = obj["purpose"]?.GetValue<string>() ?? "",
-            CurrentPosition = obj["currentPosition"]?.GetValue<string>() ?? "",
-            ExplicitRemainingWork = obj["explicitRemainingWork"]?.GetValue<string>() ?? "",
-            NextAction = obj["nextAction"]?.GetValue<string>() ?? "",
-            Uncertainty = obj["uncertainty"]?.GetValue<string>() ?? "",
-            SelectedPullUrls = Strings(obj["selectedPullUrls"] as JsonArray),
-        };
+            var obj = JsonNode.Parse(json) as JsonObject ?? throw new StatusCheckException("Assessment JSON is not an object.");
+            return new ThreadAssessment
+            {
+                Summary = obj["summary"]?.GetValue<string>() ?? "",
+                Purpose = obj["purpose"]?.GetValue<string>() ?? "",
+                CurrentPosition = obj["currentPosition"]?.GetValue<string>() ?? "",
+                ExplicitRemainingWork = obj["explicitRemainingWork"]?.GetValue<string>() ?? "",
+                NextAction = obj["nextAction"]?.GetValue<string>() ?? "",
+                Uncertainty = obj["uncertainty"]?.GetValue<string>() ?? "",
+                SelectedPullUrls = Strings(obj["selectedPullUrls"] as JsonArray),
+            };
+        }
+        catch (StatusCheckException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+        {
+            throw new StatusCheckException("Assessment JSON is not an object.", ex);
+        }
     }
 
     internal static IReadOnlyList<LedgerFieldUpdate> ParseReconcile(string json)
     {
-        var obj = JsonNode.Parse(json) as JsonObject ?? throw new StatusCheckException("Reconcile JSON is not an object.");
-        var array = obj["updates"] as JsonArray ?? throw new StatusCheckException("Reconcile JSON has no updates.");
-        var updates = new List<LedgerFieldUpdate>();
-        foreach (var node in array)
+        try
         {
-            if (node is not JsonObject item)
+            var obj = JsonNode.Parse(json) as JsonObject ?? throw new StatusCheckException("Reconcile JSON is not an object.");
+            var array = obj["updates"] as JsonArray ?? throw new StatusCheckException("Reconcile JSON has no updates.");
+            var updates = new List<LedgerFieldUpdate>();
+            foreach (var node in array)
             {
-                continue;
+                if (node is not JsonObject item)
+                {
+                    continue;
+                }
+
+                updates.Add(new LedgerFieldUpdate(
+                    item["workstream"]?.GetValue<string>() ?? "",
+                    item["action"]?.GetValue<string>() ?? "none",
+                    NullableText(item, "current"),
+                    NullableText(item, "next"),
+                    NullableText(item, "waiting"),
+                    item["reason"]?.GetValue<string>() ?? "",
+                    Strings(item["reportIds"] as JsonArray)));
             }
 
-            updates.Add(new LedgerFieldUpdate(
-                item["workstream"]?.GetValue<string>() ?? "",
-                item["action"]?.GetValue<string>() ?? "none",
-                NullableText(item, "current"),
-                NullableText(item, "next"),
-                NullableText(item, "waiting"),
-                item["reason"]?.GetValue<string>() ?? "",
-                Strings(item["reportIds"] as JsonArray)));
+            return updates;
         }
-
-        return updates;
+        catch (StatusCheckException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+        {
+            throw new StatusCheckException("Reconcile JSON is not an object.", ex);
+        }
     }
 
     private static string? NullableText(JsonObject item, string name)
@@ -414,6 +436,11 @@ internal sealed class ThreadView
     public required ThreadRecord Thread { get; init; }
     public ThreadAssessment? Assessment { get; init; }
     public required IReadOnlyList<PullRequestSnapshot> Pulls { get; init; }
+
+    /// <summary>
+    /// 選んだ PR のどれかを取得できなかった。この報告だけでは workstream を消さない。
+    /// </summary>
+    public bool PullLookupFailed { get; init; }
 }
 
 internal static class Pricing

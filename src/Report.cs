@@ -17,6 +17,7 @@ internal static class ReportWriter
         builder.AppendLine("- ChatGPT Chat の履歴は収集していない。");
         builder.AppendLine();
         AppendSkips(builder, model.SkippedLogs);
+        AppendRecordSkips(builder, model.SkippedRecords);
         builder.AppendLine("## 採用した報告");
         builder.AppendLine();
         var reported = model.Threads.Where(view => view.Thread.HasResponse).ToList();
@@ -59,7 +60,7 @@ internal static class ReportWriter
         return builder.ToString();
     }
 
-    internal static string WriteEstimate(TimeWindow window, DateTimeOffset queriedAt, EstimateReport estimate, IReadOnlyList<IngestSkip> skips)
+    internal static string WriteEstimate(TimeWindow window, DateTimeOffset queriedAt, EstimateReport estimate, IReadOnlyList<IngestSkip> skips, IReadOnlyList<ProcessingSkip> recordSkips)
     {
         var builder = new StringBuilder();
         builder.AppendLine("# 送信量の推定");
@@ -82,6 +83,7 @@ internal static class ReportWriter
         builder.AppendLine("- 途中ログがpayloadに含まれる: " + (estimate.PayloadContainsToolUpdates ? "はい" : "いいえ"));
         builder.AppendLine();
         AppendSkips(builder, skips);
+        AppendRecordSkips(builder, recordSkips);
         builder.AppendLine("## 採用した応答");
         builder.AppendLine();
         foreach (var thread in estimate.Selected.Where(thread => thread.HasResponse))
@@ -111,6 +113,25 @@ internal static class ReportWriter
         builder.AppendLine();
     }
 
+    private static void AppendRecordSkips(StringBuilder builder, IReadOnlyList<ProcessingSkip> skips)
+    {
+        builder.AppendLine("## 飛ばした対象");
+        builder.AppendLine();
+        if (skips.Count == 0)
+        {
+            builder.AppendLine("なし。");
+        }
+        else
+        {
+            foreach (var skip in skips)
+            {
+                builder.AppendLine("- " + skip.ToReport());
+            }
+        }
+
+        builder.AppendLine();
+    }
+
     private static void AppendThread(StringBuilder builder, ThreadView view, TimeWindow window)
     {
         var thread = view.Thread;
@@ -124,6 +145,10 @@ internal static class ReportWriter
         builder.AppendLine("- 現在地: " + (string.IsNullOrWhiteSpace(view.Assessment?.CurrentPosition) ? "記録なし" : view.Assessment!.CurrentPosition));
         builder.AppendLine("- 明示的な残作業: " + (string.IsNullOrWhiteSpace(view.Assessment?.ExplicitRemainingWork) ? "なし" : view.Assessment!.ExplicitRemainingWork));
         builder.AppendLine("- 照会時点のPR: " + PullSummary(view));
+        if (view.PullLookupFailed)
+        {
+            builder.AppendLine("- 取得できなかったPRがある。");
+        }
         foreach (var line in MergeTiming(view, window))
         {
             builder.AppendLine("- " + line);
@@ -177,4 +202,5 @@ internal sealed class ReportModel
     public required int OutputTokens { get; init; }
     public required decimal EstimatedUsd { get; init; }
     public IReadOnlyList<IngestSkip> SkippedLogs { get; init; } = [];
+    public IReadOnlyList<ProcessingSkip> SkippedRecords { get; init; } = [];
 }

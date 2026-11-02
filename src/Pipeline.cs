@@ -16,14 +16,15 @@ internal static class StatusPipeline
         string? reportPath = null;
         string? proposalPath = null;
         var skips = new List<IngestSkip>();
+        var recordSkips = new List<ProcessingSkip>();
         try
         {
             skips.AddRange(Ingest(request));
             var threads = request.Store.ListThreads();
             if (request.EstimateOnly)
             {
-                var estimate = DescribeEstimate(request, threads);
-                reportPath = WriteEstimate(request, runId, estimate, skips);
+                var estimate = DescribeEstimate(request, threads, recordSkips);
+                reportPath = WriteEstimate(request, runId, estimate, skips, recordSkips);
                 request.Store.FinishRun(runId, "succeeded", reportPath, null);
                 return new RunResult
                 {
@@ -32,14 +33,15 @@ internal static class StatusPipeline
                     AppliedCards = [],
                     ExitCode = 0,
                     SkippedLogs = skips,
+                    SkippedRecords = recordSkips,
                     EstimatedInputTokens = estimate.InputTokens,
                     PlannedCalls = estimate.AssessCalls + estimate.ReconcileCalls,
                     Estimated = true,
                 };
             }
 
-            var cards = CardParser.LoadRepository(request.Config.LedgerRepository);
-            var plan = await PlanAsync(request, threads, cards, cancellationToken);
+            var cards = CardParser.LoadRepository(request.Config.LedgerRepository, recordSkips);
+            var plan = await PlanAsync(request, threads, cards, recordSkips, cancellationToken);
             var staged = StampBlobs(request.Config.LedgerRepository, plan.Changes);
             proposalPath = WriteProposal(request.Config, runId, staged);
             var applied = new List<string>();
@@ -59,7 +61,7 @@ internal static class StatusPipeline
             }
 
             var usage = request.Store.UsageTotals(runId);
-            reportPath = WriteReport(request, runId, plan, LedgerText(request.ApplyLedger, staged, applied, stop), usage, skips);
+            reportPath = WriteReport(request, runId, plan, LedgerText(request.ApplyLedger, staged, applied, stop), usage, skips, recordSkips);
             request.Store.FinishRun(runId, exit == 0 ? "succeeded" : "failed", reportPath, proposalPath);
             return new RunResult
             {
@@ -69,6 +71,7 @@ internal static class StatusPipeline
                 StopReason = stop,
                 ExitCode = exit,
                 SkippedLogs = skips,
+                SkippedRecords = recordSkips,
             };
         }
         catch (Exception ex) when (ex is StatusCheckException or AggregateException)
@@ -85,6 +88,7 @@ internal static class StatusPipeline
                 StopReason = message,
                 ExitCode = 1,
                 SkippedLogs = skips,
+                SkippedRecords = recordSkips,
             };
         }
     }
@@ -155,47 +159,60 @@ internal static class StatusPipeline
         var option = searchAllDirectories ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         foreach (var path in Directory.EnumerateFiles(root, pattern, option).OrderBy(item => item, StringComparer.OrdinalIgnoreCase))
         {
-            var info = new FileInfo(path);
-            var cursor = request.Store.GetCursor(path);
-            var versionReset = cursor is null || cursor.ScanVersion < Normalize.InputModelVersion;
-            if (!versionReset &&
-                cursor is not null &&
-                cursor.Size == info.Length &&
-                cursor.ByteOffset == info.Length &&
-                info.LastWriteTimeUtc < request.Window.FromUtc)
+            try
             {
-                continue;
+                IngestFile(request, path, source, skips);
             }
-
-            var read = ByteLog.Read(
-                path,
-                versionReset ? 0 : cursor?.ByteOffset ?? 0,
-                versionReset ? 0 : cursor?.Size ?? 0,
-                versionReset ? null : cursor?.PrefixHash,
-                versionReset ? 1 : cursor?.NextLine ?? 1);
-            if (read.DecodeError is not null)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                skips.Add(new IngestSkip(path, null, read.DecodeError));
+                // 1ファイルが読めなくても、他のログは取り込む。
+                skips.Add(new IngestSkip(path, null, ex.Message));
             }
-
-            var working = cursor ?? new FileCursor();
-            var rebuild = versionReset || read.Reset;
-            ReadCodex(request, path, read, working, rebuild, skips);
-
-            request.Store.SaveCursor(path, source, new FileCursor
-            {
-                ByteOffset = read.NewOffset,
-                Size = read.Size,
-                PrefixHash = read.PrefixHash,
-                NextLine = read.NextLine,
-                NativeId = working.NativeId,
-                Repository = working.Repository,
-                Cwd = working.Cwd,
-                LastEventUtc = working.LastEventUtc,
-                Terminal = working.Terminal,
-                ScanVersion = Normalize.InputModelVersion,
-            });
         }
+    }
+
+    private static void IngestFile(RunRequest request, string path, string source, List<IngestSkip> skips)
+    {
+        var info = new FileInfo(path);
+        var cursor = request.Store.GetCursor(path);
+        var versionReset = cursor is null || cursor.ScanVersion < Normalize.InputModelVersion;
+        if (!versionReset &&
+            cursor is not null &&
+            cursor.Size == info.Length &&
+            cursor.ByteOffset == info.Length &&
+            info.LastWriteTimeUtc < request.Window.FromUtc)
+        {
+            return;
+        }
+
+        var read = ByteLog.Read(
+            path,
+            versionReset ? 0 : cursor?.ByteOffset ?? 0,
+            versionReset ? 0 : cursor?.Size ?? 0,
+            versionReset ? null : cursor?.PrefixHash,
+            versionReset ? 1 : cursor?.NextLine ?? 1);
+        if (read.DecodeError is not null)
+        {
+            skips.Add(new IngestSkip(path, null, read.DecodeError));
+        }
+
+        var working = cursor ?? new FileCursor();
+        var rebuild = versionReset || read.Reset;
+        ReadCodex(request, path, read, working, rebuild, skips);
+
+        request.Store.SaveCursor(path, source, new FileCursor
+        {
+            ByteOffset = read.NewOffset,
+            Size = read.Size,
+            PrefixHash = read.PrefixHash,
+            NextLine = read.NextLine,
+            NativeId = working.NativeId,
+            Repository = working.Repository,
+            Cwd = working.Cwd,
+            LastEventUtc = working.LastEventUtc,
+            Terminal = working.Terminal,
+            ScanVersion = Normalize.InputModelVersion,
+        });
     }
 
     private static void ReadCodex(RunRequest request, string path, ByteLog.ReadResult read, FileCursor cursor, bool rebuild, List<IngestSkip> skips)
@@ -320,12 +337,18 @@ internal static class StatusPipeline
         return excerpt with { Text = text };
     }
 
-    private static async Task<AnalysisPlan> PlanAsync(RunRequest request, IReadOnlyList<ThreadRecord> threads, IReadOnlyList<ProjectCard> cards, CancellationToken cancellationToken)
+    private static async Task<AnalysisPlan> PlanAsync(
+        RunRequest request,
+        IReadOnlyList<ThreadRecord> threads,
+        IReadOnlyList<ProjectCard> cards,
+        List<ProcessingSkip> skipped,
+        CancellationToken cancellationToken)
     {
         var holds = new List<HoldNote>();
         var reports = new List<ThreadView>();
         var eligible = threads.Where(thread => thread.Overlaps(request.Window) && thread.HasResponse && !IsSelf(thread)).ToList();
         var gate = new SemaphoreSlim(Math.Max(1, request.Config.MaxParallel));
+        var skipGate = new object();
         var assessed = new System.Collections.Concurrent.ConcurrentBag<ThreadRecord>();
         var tasks = eligible.Select(async thread =>
         {
@@ -333,6 +356,11 @@ internal static class StatusPipeline
             try
             {
                 assessed.Add(await AssessOneAsync(request, thread, cancellationToken));
+            }
+            catch (StatusCheckException ex) when (!ex.Fatal)
+            {
+                // 1スレッドの評価失敗で、他のスレッドの照合を止めない。
+                RecordSkip(skipped, skipGate, thread.Source + ":" + thread.NativeId, ex.Message);
             }
             finally
             {
@@ -367,7 +395,7 @@ internal static class StatusPipeline
             groups[match.Card.RelativePath] = group;
         }
 
-        foreach (var tracked in await RefreshOutsideWindowAsync(request, threads, eligible, cards, cancellationToken))
+        foreach (var tracked in await RefreshOutsideWindowAsync(request, threads, eligible, cards, skipped, skipGate, cancellationToken))
         {
             if (groups.TryGetValue(tracked.Card.RelativePath, out var existing))
             {
@@ -387,9 +415,13 @@ internal static class StatusPipeline
             groups[tracked.Card.RelativePath] = (tracked.Card, [tracked.Thread]);
         }
 
+        var failedPulls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var snapshots = await QueryPullsAsync(
             request,
             groups.Values.SelectMany(group => group.Threads.SelectMany(thread => SelectedCandidates(thread).Select(reference => (reference, thread.Source + ":" + thread.NativeId)))),
+            failedPulls,
+            skipped,
+            skipGate,
             cancellationToken);
         var changes = new List<LedgerChange>();
         foreach (var group in groups.Values)
@@ -399,6 +431,7 @@ internal static class StatusPipeline
                 Thread = thread,
                 Assessment = thread.Assessment,
                 Pulls = ChoosePulls(thread, snapshots),
+                PullLookupFailed = SelectedCandidates(thread).Any(candidate => failedPulls.Contains(candidate.Url)),
             }).ToList();
             reports.AddRange(views);
             if (views.Any(view => view.Assessment is null))
@@ -412,14 +445,22 @@ internal static class StatusPipeline
                 continue;
             }
 
-            var updates = await ModelOf(request).ReconcileAsync(ThreadPrompts.ReconcileSystem, ThreadPrompts.ReconcileUser(group.Card, views), cancellationToken);
-            var change = LedgerPlanner.Apply(group.Card, views, updates);
-            if (change is not null)
+            try
             {
-                changes.Add(change);
-            }
+                var updates = await ModelOf(request).ReconcileAsync(ThreadPrompts.ReconcileSystem, ThreadPrompts.ReconcileUser(group.Card, views), cancellationToken);
+                var change = LedgerPlanner.Apply(group.Card, views, updates);
+                if (change is not null)
+                {
+                    changes.Add(change);
+                }
 
-            Remember(request.Store, group.Card, views, change);
+                Remember(request.Store, group.Card, views, change);
+            }
+            catch (StatusCheckException ex) when (!ex.Fatal)
+            {
+                // 1枚の照合失敗で、他のカードの更新を止めない。
+                RecordSkip(skipped, skipGate, group.Card.RelativePath, ex.Message);
+            }
         }
 
         return new AnalysisPlan(reports, holds, changes);
@@ -483,6 +524,8 @@ internal static class StatusPipeline
         IReadOnlyList<ThreadRecord> threads,
         IReadOnlyList<ThreadRecord> eligible,
         IReadOnlyList<ProjectCard> cards,
+        List<ProcessingSkip> skipped,
+        object skipGate,
         CancellationToken cancellationToken)
     {
         var inside = eligible.Select(thread => thread.Source + ":" + thread.NativeId).ToHashSet(StringComparer.Ordinal);
@@ -494,8 +537,9 @@ internal static class StatusPipeline
             {
                 fresh = await PullsOf(request).GetAsync(tracked.Snapshot.Owner, tracked.Snapshot.Repository, tracked.Snapshot.Number, cancellationToken);
             }
-            catch (StatusCheckException)
+            catch (StatusCheckException ex) when (!ex.Fatal)
             {
+                RecordSkip(skipped, skipGate, tracked.Snapshot.Url, ex.Message);
                 continue;
             }
 
@@ -533,36 +577,56 @@ internal static class StatusPipeline
     private static async Task<Dictionary<string, PullRequestSnapshot>> QueryPullsAsync(
         RunRequest request,
         IEnumerable<(GitHubRef Reference, string ActivityId)> pairs,
+        HashSet<string> failedUrls,
+        List<ProcessingSkip> skipped,
+        object skipGate,
         CancellationToken cancellationToken)
     {
         var snapshots = new Dictionary<string, PullRequestSnapshot>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in pairs.GroupBy(item => item.Reference.Url, StringComparer.OrdinalIgnoreCase).Select(group => group.First()))
         {
-            if (snapshots.ContainsKey(pair.Reference.Url))
+            if (snapshots.ContainsKey(pair.Reference.Url) || failedUrls.Contains(pair.Reference.Url))
             {
                 continue;
             }
 
-            var snapshot = await PullsOf(request).GetAsync(pair.Reference.Owner, pair.Reference.Repository, pair.Reference.Number, cancellationToken);
-            snapshots[snapshot.Url] = snapshot;
-            request.Store.UpsertPull(snapshot, pair.ActivityId);
+            try
+            {
+                var snapshot = await PullsOf(request).GetAsync(pair.Reference.Owner, pair.Reference.Repository, pair.Reference.Number, cancellationToken);
+                snapshots[snapshot.Url] = snapshot;
+                request.Store.UpsertPull(snapshot, pair.ActivityId);
+            }
+            catch (StatusCheckException ex) when (!ex.Fatal)
+            {
+                // 存在しない PR や gh の失敗は、その URL だけ飛ばす。
+                failedUrls.Add(pair.Reference.Url);
+                RecordSkip(skipped, skipGate, pair.Reference.Url, ex.Message);
+            }
         }
 
         return snapshots;
     }
 
+    private static void RecordSkip(List<ProcessingSkip> skipped, object gate, string subject, string message)
+    {
+        lock (gate)
+        {
+            skipped.Add(new ProcessingSkip(subject, message));
+        }
+    }
+
     private static IActivityModel ModelOf(RunRequest request) =>
-        request.Model ?? throw new StatusCheckException("A model is required.");
+        request.Model ?? throw new StatusCheckException("A model is required.", fatal: true);
 
     private static IPullRequestSource PullsOf(RunRequest request) =>
-        request.Pulls ?? throw new StatusCheckException("A pull request source is required.");
+        request.Pulls ?? throw new StatusCheckException("A pull request source is required.", fatal: true);
 
-    private static EstimateReport DescribeEstimate(RunRequest request, IReadOnlyList<ThreadRecord> threads)
+    private static EstimateReport DescribeEstimate(RunRequest request, IReadOnlyList<ThreadRecord> threads, List<ProcessingSkip> skipped)
     {
         IReadOnlyList<ProjectCard> cards;
         try
         {
-            cards = CardParser.LoadRepository(request.Config.LedgerRepository);
+            cards = CardParser.LoadRepository(request.Config.LedgerRepository, skipped);
         }
         catch (StatusCheckException)
         {
@@ -796,7 +860,7 @@ internal static class StatusPipeline
         return changes.Select(change => change.RelativePath).ToList();
     }
 
-    private static string WriteReport(RunRequest request, string runId, AnalysisPlan plan, string ledgerSummary, (int InputTokens, int OutputTokens, decimal Usd) usage, IReadOnlyList<IngestSkip> skips)
+    private static string WriteReport(RunRequest request, string runId, AnalysisPlan plan, string ledgerSummary, (int InputTokens, int OutputTokens, decimal Usd) usage, IReadOnlyList<IngestSkip> skips, IReadOnlyList<ProcessingSkip> recordSkips)
     {
         var directory = Path.Combine(request.Config.ReportsDirectory, runId);
         Directory.CreateDirectory(directory);
@@ -812,17 +876,18 @@ internal static class StatusPipeline
             OutputTokens = usage.OutputTokens,
             EstimatedUsd = usage.Usd,
             SkippedLogs = skips,
+            SkippedRecords = recordSkips,
         });
         File.WriteAllText(path, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         return path;
     }
 
-    private static string WriteEstimate(RunRequest request, string runId, EstimateReport estimate, IReadOnlyList<IngestSkip> skips)
+    private static string WriteEstimate(RunRequest request, string runId, EstimateReport estimate, IReadOnlyList<IngestSkip> skips, IReadOnlyList<ProcessingSkip> recordSkips)
     {
         var directory = Path.Combine(request.Config.ReportsDirectory, runId);
         Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, "report.md");
-        File.WriteAllText(path, ReportWriter.WriteEstimate(request.Window, request.Now, estimate, skips), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        File.WriteAllText(path, ReportWriter.WriteEstimate(request.Window, request.Now, estimate, skips, recordSkips), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         return path;
     }
 
@@ -971,6 +1036,7 @@ internal sealed class RunResult
     public string? StopReason { get; init; }
     public int ExitCode { get; init; }
     public IReadOnlyList<IngestSkip> SkippedLogs { get; init; } = [];
+    public IReadOnlyList<ProcessingSkip> SkippedRecords { get; init; } = [];
     public int EstimatedInputTokens { get; init; }
     public int PlannedCalls { get; init; }
     public bool Estimated { get; init; }

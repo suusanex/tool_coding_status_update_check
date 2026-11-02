@@ -9,7 +9,7 @@ using System.Text.RegularExpressions;
 /// </summary>
 internal static partial class CardParser
 {
-    internal static IReadOnlyList<ProjectCard> LoadRepository(string repository)
+    internal static IReadOnlyList<ProjectCard> LoadRepository(string repository, ICollection<ProcessingSkip>? skips = null)
     {
         var directory = Path.Combine(repository, "projects");
         if (!Directory.Exists(directory))
@@ -21,7 +21,15 @@ internal static partial class CardParser
         foreach (var path in Directory.EnumerateFiles(directory, "*.md").OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
         {
             var relative = Path.GetRelativePath(repository, path).Replace('\\', '/');
-            cards.Add(Parse(relative, File.ReadAllText(path)));
+            try
+            {
+                cards.Add(Parse(relative, File.ReadAllText(path)));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 1枚が読めなくても、他の Project カードの照合は続ける。
+                skips?.Add(new ProcessingSkip(relative, ex.Message));
+            }
         }
 
         return cards;
@@ -447,6 +455,12 @@ internal static class LedgerPlanner
     internal static bool CanDelete(IReadOnlyList<ThreadView> reports)
     {
         if (reports.Count == 0)
+        {
+            return false;
+        }
+
+        // 取得できなかった PR があると、見えている PR だけでは完了にできない。
+        if (reports.Any(report => report.PullLookupFailed))
         {
             return false;
         }

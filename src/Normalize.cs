@@ -62,7 +62,12 @@ internal static partial class Normalize
                 continue;
             }
 
-            found.Add(new GitHubRef(url, match.Groups["owner"].Value, match.Groups["repo"].Value, int.Parse(match.Groups["num"].Value, System.Globalization.CultureInfo.InvariantCulture), kind));
+            if (!int.TryParse(match.Groups["num"].Value, System.Globalization.CultureInfo.InvariantCulture, out var number))
+            {
+                continue;
+            }
+
+            found.Add(new GitHubRef(url, match.Groups["owner"].Value, match.Groups["repo"].Value, number, kind));
         }
 
         return found;

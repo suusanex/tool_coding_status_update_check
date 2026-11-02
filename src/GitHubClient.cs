@@ -39,22 +39,33 @@ internal sealed class GhPullRequestSource : IPullRequestSource
             throw new StatusCheckException($"gh pr view {owner}/{repository}#{number} failed: {stderr.Trim()}");
         }
 
-        var obj = JsonNode.Parse(stdout) as JsonObject ?? throw new StatusCheckException("gh returned unexpected JSON for " + owner + "/" + repository + "#" + number);
-        var mergedAt = ParseTime(obj["mergedAt"]);
-        var closedAt = ParseTime(obj["closedAt"]);
-        var stateText = obj["state"]?.GetValue<string>() ?? "";
-        var state = mergedAt is not null || stateText.Equals("MERGED", StringComparison.OrdinalIgnoreCase)
-            ? PullRequestState.Merged
-            : stateText.Equals("OPEN", StringComparison.OrdinalIgnoreCase)
-                ? PullRequestState.Open
-                : PullRequestState.ClosedUnmerged;
-        var url = obj["url"]?.GetValue<string>();
-        if (string.IsNullOrWhiteSpace(url))
+        try
         {
-            url = "https://github.com/" + owner + "/" + repository + "/pull/" + number.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        }
+            var obj = JsonNode.Parse(stdout) as JsonObject ?? throw new StatusCheckException("gh returned unexpected JSON for " + owner + "/" + repository + "#" + number);
+            var mergedAt = ParseTime(obj["mergedAt"]);
+            var closedAt = ParseTime(obj["closedAt"]);
+            var stateText = obj["state"]?.GetValue<string>() ?? "";
+            var state = mergedAt is not null || stateText.Equals("MERGED", StringComparison.OrdinalIgnoreCase)
+                ? PullRequestState.Merged
+                : stateText.Equals("OPEN", StringComparison.OrdinalIgnoreCase)
+                    ? PullRequestState.Open
+                    : PullRequestState.ClosedUnmerged;
+            var url = obj["url"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                url = "https://github.com/" + owner + "/" + repository + "/pull/" + number.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
 
-        return new PullRequestSnapshot(url, owner, repository, number, state, mergedAt, closedAt, obj["title"]?.GetValue<string>() ?? "");
+            return new PullRequestSnapshot(url, owner, repository, number, state, mergedAt, closedAt, obj["title"]?.GetValue<string>() ?? "");
+        }
+        catch (StatusCheckException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
+        {
+            throw new StatusCheckException("gh returned unexpected JSON for " + owner + "/" + repository + "#" + number, ex);
+        }
     }
 
     private static DateTimeOffset? ParseTime(JsonNode? node)

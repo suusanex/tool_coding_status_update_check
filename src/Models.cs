@@ -197,15 +197,23 @@ internal static class JsonLists
     }
 }
 
+/// <summary>
+/// 処理の失敗。Fatal が false のときは対象1件を飛ばして実行を続けられる。
+/// 費用上限や前提の欠落など、続きの対象にも同じ失敗が起きるものは Fatal にする。
+/// </summary>
 internal sealed class StatusCheckException : Exception
 {
-    public StatusCheckException(string message) : base(message)
+    public StatusCheckException(string message, bool fatal = false) : base(message)
     {
+        Fatal = fatal;
     }
 
-    public StatusCheckException(string message, Exception inner) : base(message, inner)
+    public StatusCheckException(string message, Exception inner, bool fatal = false) : base(message, inner)
     {
+        Fatal = fatal;
     }
+
+    public bool Fatal { get; }
 }
 
 /// <summary>
@@ -242,4 +250,14 @@ internal sealed record IngestSkip(string Path, long? LineNumber, string Message)
 
         return Path + ": " + Message;
     }
+}
+
+/// <summary>
+/// ログ以外で、対象1件だけ失敗して飛ばした処理。実行は続ける。
+/// </summary>
+internal sealed record ProcessingSkip(string Subject, string Message)
+{
+    public string ToLog() => "skipped " + Subject + ": " + Message;
+
+    public string ToReport() => Subject + ": " + Message;
 }

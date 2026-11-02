@@ -33,7 +33,7 @@ await Case("unmatched repository does not change the card", Unmatched);
 await Case("two reports for one workstream do not stop the run", TwoReports);
 await Case("rerun does not add another commit", Rerun);
 await Case("apply writes the preview and rejects a changed pull", ApplyProposal);
-await Case("model failure keeps the cursor and does not commit", ModelFailure);
+await Case("one model failure does not stop the other thread", ModelFailure);
 await Case("an incomplete line is resumed once", IncompleteLine);
 await Case("invalid json does not stop the run", InvalidJsonContinues);
 await Case("invalid utf-8 chunk is skipped", InvalidUtf8Chunk);
@@ -48,6 +48,11 @@ await Case("a replaced rollout does not keep the old thread", ReplacedRolloutDro
 await Case("an outside merge stays with an active card", OutsideMergeJoinsActiveCard);
 await Case("an unselected pull does not hold the card", UnselectedPullDoesNotHold);
 await Case("openai failure keeps status and detail", OpenAiFailureMessage);
+await Case("a missing pull does not stop the run", MissingPullContinues);
+await Case("a failed pull does not delete the workstream", FailedPullBlocksDelete);
+await Case("one reconcile failure does not stop the other card", ReconcileFailureContinues);
+await Case("an unreadable rollout does not stop the run", UnreadableRolloutContinues);
+await Case("an unreadable card does not stop the run", UnreadableCardContinues);
 
 if (failures.Count > 0)
 {
@@ -406,18 +411,26 @@ async Task ModelFailure()
 {
     await using var world = World.Create();
     world.WriteCard(OneCard("なし。"));
-    var before = world.CardText();
     world.WriteRollout(
-        "sess",
+        "bad",
+        "https://github.com/acme/widgets",
+        LogText.User("壊れた評価。"),
+        LogText.Assistant("FAIL_MODEL 実装を完了した。", "final_answer"));
+    world.WriteRollout(
+        "good",
         "https://github.com/acme/widgets",
         LogText.User("ウィジェットを直して。"),
-        LogText.Assistant("FAIL_MODEL 実装を完了した。", "final_answer"));
+        LogText.Assistant("実装を開始した。", "final_answer", "2026-11-01T00:40:00Z"));
     var result = await world.Run(true);
-    Check(result.ExitCode == 1, "model failure succeeded");
-    Check(world.CardText() == before, "model failure committed the card");
-    var cursor = world.Store.GetCursor(world.RolloutPath("sess"));
-    var length = new FileInfo(world.RolloutPath("sess")).Length;
+    Check(result.ExitCode == 0, result.StopReason ?? "one model failure stopped the run");
+    Check(result.SkippedRecords.Any(skip => skip.Subject == "codex:bad" && skip.Message.Contains("scripted model failure", StringComparison.Ordinal)), "model failure was not reported");
+    Check(world.Store.GetThread("codex", "bad")?.Assessment is null, "failed assessment was stored");
+    Check(world.CardText().Contains("実装を開始した。", StringComparison.Ordinal), "the other thread was not applied");
+    Check(!world.CardText().Contains("FAIL_MODEL", StringComparison.Ordinal), "failed thread was written");
+    var cursor = world.Store.GetCursor(world.RolloutPath("bad"));
+    var length = new FileInfo(world.RolloutPath("bad")).Length;
     Check(cursor is not null && cursor.ByteOffset == length, "model failure rewound the cursor");
+    Check(File.ReadAllText(result.ReportPath).Contains("scripted model failure", StringComparison.Ordinal), "report missed the model failure");
 }
 
 async Task IncompleteLine()
@@ -806,6 +819,135 @@ Task OpenAiFailureMessage()
     return Task.CompletedTask;
 }
 
+async Task MissingPullContinues()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
+    world.WriteRollout(
+        "missing",
+        "https://github.com/acme/widgets",
+        LogText.User("存在しない番号。"),
+        LogText.Assistant("番号だけの参照。 https://github.com/acme/widgets/pull/1", "final_answer"));
+    world.WriteRollout(
+        "good",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を開始した。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:40:00Z"));
+    var result = await world.Run(true);
+    Check(result.ExitCode == 0, result.StopReason ?? "missing pull stopped the run");
+    Check(result.SkippedRecords.Any(skip => skip.Subject.Contains("/pull/1", StringComparison.Ordinal)), "missing pull was not reported");
+    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "missing pull deleted the workstream");
+    Check(world.CardText().Contains("実装を開始した。", StringComparison.Ordinal), "the other thread was not applied");
+    Check(File.ReadAllText(result.ReportPath).Contains("pull/1", StringComparison.Ordinal), "report missed the pull skip");
+}
+
+async Task FailedPullBlocksDelete()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var before = world.CardText();
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7 https://github.com/acme/widgets/pull/1", "final_answer"));
+    var result = await world.Run(true);
+    Check(result.ExitCode == 0, result.StopReason ?? "incomplete pull state stopped the run");
+    Check(result.SkippedRecords.Any(skip => skip.Subject.Contains("/pull/1", StringComparison.Ordinal)), "failed pull was not reported");
+    Check(world.CardText() == before, "incomplete pull state changed the card");
+    Check(File.ReadAllText(result.ReportPath).Contains("取得できなかったPRがある。", StringComparison.Ordinal), "report hid the failed pull");
+}
+
+async Task ReconcileFailureContinues()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var otherPath = Path.Combine(world.Ledger, "projects", "other.md");
+    var otherCard = OneCard("なし。").Replace("acme/widgets", "acme/other", StringComparison.Ordinal);
+    File.WriteAllText(otherPath, otherCard.Replace("\r\n", "\n", StringComparison.Ordinal), World.FileEncoding);
+    LedgerGit.Run(world.Ledger, ["add", "--", "projects/other.md"]);
+    LedgerGit.Run(world.Ledger, ["commit", "-m", "add other"]);
+    var otherBefore = File.ReadAllText(otherPath);
+    world.WriteRollout(
+        "other",
+        "https://github.com/acme/other",
+        LogText.User("別カード。"),
+        LogText.Assistant("FAIL_RECONCILE 実装を開始した。", "final_answer"));
+    world.WriteRollout(
+        "good",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を開始した。", "final_answer"));
+    var result = await world.Run(true);
+    Check(result.ExitCode == 0, result.StopReason ?? "one reconcile failure stopped the run");
+    Check(result.SkippedRecords.Any(skip => skip.Subject == "projects/other.md" && skip.Message.Contains("scripted reconcile failure", StringComparison.Ordinal)), "reconcile failure was not reported");
+    Check(File.ReadAllText(otherPath) == otherBefore, "failed card was written");
+    Check(world.CardText().Contains("実装を開始した。", StringComparison.Ordinal), "the other card was not applied");
+}
+
+async Task UnreadableRolloutContinues()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var badPath = world.RolloutPath("bad");
+    Directory.CreateDirectory(Path.GetDirectoryName(badPath)!);
+    File.WriteAllText(badPath, LogText.Meta("bad", "https://github.com/acme/widgets") + "\n" + LogText.User("読めない。") + "\n", World.FileEncoding);
+    FileStream? locked = null;
+    try
+    {
+        locked = new FileStream(badPath, FileMode.Open, FileAccess.Read, FileShare.None);
+        world.WriteRollout(
+            "good",
+            "https://github.com/acme/widgets",
+            LogText.User("ウィジェットを直して。"),
+            LogText.Assistant("実装を開始した。", "final_answer"));
+        var result = await world.Run(false);
+        Check(result.ExitCode == 0, result.StopReason ?? "locked rollout stopped the run");
+        Check(result.SkippedLogs.Any(skip => skip.Path == badPath && skip.LineNumber is null), "locked rollout was not skipped");
+        Check(world.Store.GetThread("codex", "good")?.Response?.Text.Contains("実装を開始した。", StringComparison.Ordinal) == true, "later file was not read");
+        Check(world.Store.GetCursor(badPath) is null, "locked rollout advanced the cursor");
+    }
+    finally
+    {
+        locked?.Dispose();
+    }
+}
+
+async Task UnreadableCardContinues()
+{
+    await using var world = World.Create();
+    world.WriteCard(OneCard("なし。"));
+    var otherPath = Path.Combine(world.Ledger, "projects", "other.md");
+    File.WriteAllText(otherPath, OneCard("なし。").Replace("acme/widgets", "acme/other", StringComparison.Ordinal).Replace("\r\n", "\n", StringComparison.Ordinal), World.FileEncoding);
+    LedgerGit.Run(world.Ledger, ["add", "--", "projects/other.md"]);
+    LedgerGit.Run(world.Ledger, ["commit", "-m", "add other"]);
+    world.WriteRollout(
+        "good",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を開始した。", "final_answer"));
+    world.WriteRollout(
+        "other",
+        "https://github.com/acme/other",
+        LogText.User("別カード。"),
+        LogText.Assistant("別リポジトリの実装を開始した。", "final_answer"));
+    FileStream? locked = null;
+    try
+    {
+        locked = new FileStream(otherPath, FileMode.Open, FileAccess.Read, FileShare.None);
+        var result = await world.Run(false);
+        Check(result.ExitCode == 0, result.StopReason ?? "locked card stopped the run");
+        Check(result.SkippedRecords.Any(skip => skip.Subject == "projects/other.md"), "locked card was not skipped");
+        Check(world.Model.Payloads.Any(payload => payload.Contains("実装を開始した。", StringComparison.Ordinal)), "readable card was not assessed");
+    }
+    finally
+    {
+        locked?.Dispose();
+    }
+}
+
 static void Check(bool condition, string message)
 {
     if (!condition)
@@ -1168,6 +1310,11 @@ internal sealed class ScriptedModel : IActivityModel
     public Task<IReadOnlyList<LedgerFieldUpdate>> ReconcileAsync(string system, string user, CancellationToken cancellationToken)
     {
         Payloads.Add(system + "\n" + user);
+        if (user.Contains("FAIL_RECONCILE", StringComparison.Ordinal))
+        {
+            throw new StatusCheckException("scripted reconcile failure");
+        }
+
         if (!user.Contains("### ウィジェット修正", StringComparison.Ordinal) || user.Contains("導入作業", StringComparison.Ordinal))
         {
             return Task.FromResult<IReadOnlyList<LedgerFieldUpdate>>([]);
