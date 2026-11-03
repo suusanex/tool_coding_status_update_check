@@ -15,6 +15,7 @@ internal sealed class AppConfig
     public required string ReasoningEffort { get; init; }
     public required int MaxParallel { get; init; }
     public required int MaxRetries { get; init; }
+    public string InputMode { get; init; } = InputModes.Default;
 
     public string DatabasePath => Path.Combine(StateDirectory, "state.sqlite");
 
@@ -55,6 +56,7 @@ internal sealed class AppConfig
                 ["reasoningEffort"] = created.ReasoningEffort,
                 ["maxParallel"] = created.MaxParallel,
                 ["maxRetries"] = created.MaxRetries,
+                ["inputMode"] = created.InputMode,
             };
             File.WriteAllText(path, json.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
             return created;
@@ -77,6 +79,7 @@ internal sealed class AppConfig
             ReasoningEffort = "medium",
             MaxParallel = 2,
             MaxRetries = 3,
+            InputMode = InputModes.Default,
         };
     }
 
@@ -101,6 +104,7 @@ internal sealed class AppConfig
         }
 
         var archived = obj["codexArchivedSessionsDir"]?.GetValue<string>();
+        var inputMode = obj["inputMode"]?.GetValue<string>();
         return new AppConfig
         {
             StateDirectory = state,
@@ -111,6 +115,7 @@ internal sealed class AppConfig
             ReasoningEffort = string.IsNullOrWhiteSpace(effort) ? "medium" : effort,
             MaxParallel = parallel,
             MaxRetries = retries,
+            InputMode = InputModes.NormalizeMode(inputMode),
         };
     }
 

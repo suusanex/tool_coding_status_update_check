@@ -53,6 +53,14 @@ await Case("a failed pull does not delete the workstream", FailedPullBlocksDelet
 await Case("one reconcile failure does not stop the other card", ReconcileFailureContinues);
 await Case("an unreadable rollout does not stop the run", UnreadableRolloutContinues);
 await Case("an unreadable card does not stop the run", UnreadableCardContinues);
+await Case("intermediate completion and usage tip do not leave false remaining work", IntermediateDirectionAndUsageTip);
+await Case("intermediate remaining work is kept unless explicitly resolved", IntermediateRemainingWorkResolvedVsOmitted);
+await Case("trailing unanswered user turn is visible and blocks deletion", TrailingUnansweredUserTurnBlocksDelete);
+await Case("unverified remaining work quote blocks deletion", UnverifiedRemainingQuoteBlocksDelete);
+await Case("tool output signal and PR URL are extracted while Issue numbers and fixture URLs are isolated", ToolOutputSignalAndIssueIsolation);
+await Case("multi-card repository disambiguates by context and distinguishes hold codes", MultiCardDisambiguationAndHoldCodes);
+await Case("stage diagnostics and trace.json record pre-selection, truncation, and unselected reports", StageDiagnosticsAndTraceJson);
+await Case("changing input mode or intermediate turns invalidates assessment cache", FingerprintInvalidationAcrossModes);
 
 if (failures.Count > 0)
 {
@@ -116,7 +124,7 @@ Task ConfigFile()
 
 async Task SelectedPayload()
 {
-    await using var world = World.Create();
+    await using var world = World.Create(InputModes.A);
     world.WriteCard(TwoCard(null));
     world.Pulls.Set("acme", "widgets", 7, PullRequestState.Open);
     world.WriteRollout(
@@ -948,6 +956,290 @@ async Task UnreadableCardContinues()
     }
 }
 
+async Task IntermediateDirectionAndUsageTip()
+{
+    await using var world = World.Create(InputModes.C);
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。", "2026-11-01T00:11:00Z"),
+        LogText.Assistant("実装を完了し PR https://github.com/acme/widgets/pull/7 をマージした。", "final_answer", "2026-11-01T00:15:00Z"),
+        LogText.User("ローカルで実行するときのオプションを教えて。", "2026-11-01T00:18:00Z"),
+        LogText.Assistant("今後の参考として、ローカルで試す場合は --help オプションを指定できる。", "final_answer", "2026-11-01T00:20:00Z"));
+    world.Model.AssessOverride = (system, user) =>
+    {
+        Check(user.Contains("[a1 assistant", StringComparison.Ordinal) && user.Contains("pull/7", StringComparison.Ordinal), "intermediate completion turn was missing from prompt");
+        return new ThreadAssessment
+        {
+            Summary = "ウィジェット修正を完了し、オプションの質問に回答した。",
+            Purpose = "ウィジェットを直す。",
+            CurrentPosition = "実装を完了した。 https://github.com/acme/widgets/pull/7",
+            ExplicitRemainingWork = "今後の参考として、ローカルで試す場合は --help オプションを指定できる。",
+            RemainingWorkSourceId = "a2",
+            NextAction = "",
+            Uncertainty = "",
+            SelectedPullUrls = ["https://github.com/acme/widgets/pull/7"],
+        };
+    };
+    world.Model.ReconcileOverride = (_, _) =>
+        [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "PR #7 マージ済み", ["codex:sess"])];
+    var result = await world.Run(true);
+    var thread = world.Store.GetThread("codex", "sess");
+    Check(string.IsNullOrEmpty(thread?.Assessment?.ExplicitRemainingWork), "usage tip after completion was kept as remaining work: " + thread?.Assessment?.ExplicitRemainingWork);
+    Check(!world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "usage tip blocked workstream completion");
+    Check(File.ReadAllText(result.TracePath!).Contains("guard_passed", StringComparison.Ordinal), "trace did not record guard_passed");
+}
+
+async Task IntermediateRemainingWorkResolvedVsOmitted()
+{
+    await using var omitted = World.Create(InputModes.C);
+    omitted.WriteCard(TwoCard(null));
+    omitted.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    omitted.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。", "2026-11-01T00:11:00Z"),
+        LogText.Assistant("PRを出した。残作業は本番設定の反映。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:15:00Z"),
+        LogText.User("テスト結果はどうだった？", "2026-11-01T00:18:00Z"),
+        LogText.Assistant("テストは全件通過し完了した。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:20:00Z"));
+    omitted.Model.AssessOverride = (_, _) => new ThreadAssessment
+    {
+        Summary = "テスト確認を完了したが本番設定の反映が残っている。",
+        Purpose = "ウィジェットを直す。",
+        CurrentPosition = "テストは全件通過したが、残作業は本番設定の反映。",
+        ExplicitRemainingWork = "残作業は本番設定の反映。",
+        RemainingWorkSourceId = "a1",
+        NextAction = "",
+        Uncertainty = "",
+        SelectedPullUrls = ["https://github.com/acme/widgets/pull/7"],
+    };
+    omitted.Model.ReconcileOverride = (_, _) =>
+        [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:sess"])];
+    var omittedResult = await omitted.Run(true);
+    var omittedThread = omitted.Store.GetThread("codex", "sess");
+    Check(omittedThread?.Assessment?.ExplicitRemainingWork == "残作業は本番設定の反映。", "intermediate remaining work from a1 was lost");
+    Check(omittedThread?.Assessment?.RemainingWorkQuoteVerified == true, "a1 quote was not verified");
+    Check(omitted.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "omitted intermediate remaining work allowed deletion");
+    Check(File.ReadAllText(omittedResult.TracePath!).Contains("guard_rejected_remaining_work", StringComparison.Ordinal), "trace missed guard_rejected_remaining_work");
+
+    await using var resolved = World.Create(InputModes.C);
+    resolved.WriteCard(TwoCard(null));
+    resolved.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    resolved.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。", "2026-11-01T00:11:00Z"),
+        LogText.Assistant("PRを出した。残作業は本番設定の反映。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:15:00Z"),
+        LogText.User("本番設定の反映もやって。", "2026-11-01T00:18:00Z"),
+        LogText.Assistant("本番設定の反映も完了した。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:20:00Z"));
+    var resolvedResult = await resolved.Run(true);
+    Check(!resolved.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "explicitly resolved remaining work blocked deletion");
+    Check(File.ReadAllText(resolvedResult.TracePath!).Contains("guard_passed", StringComparison.Ordinal), "resolved work did not pass guard");
+}
+
+async Task TrailingUnansweredUserTurnBlocksDelete()
+{
+    await using var world = World.Create(InputModes.C);
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。", "2026-11-01T00:11:00Z"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:15:00Z"),
+        LogText.User("待って、やっぱり別方式に直して。", "2026-11-01T00:19:00Z"));
+    world.Model.ReconcileOverride = (_, _) =>
+        [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:sess"])];
+    var result = await world.Run(true);
+    var thread = world.Store.GetThread("codex", "sess");
+    Check(thread?.HasTrailingUnansweredUserTurn == true, "trailing unanswered user turn was not detected");
+    Check(world.Model.Payloads[0].Contains("待って、やっぱり別方式に直して。", StringComparison.Ordinal), "trailing user turn was not included in assess prompt");
+    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "trailing unanswered user turn did not block deletion");
+    Check(File.ReadAllText(result.TracePath!).Contains("guard_rejected_unanswered_user_turn", StringComparison.Ordinal), "trace missed guard_rejected_unanswered_user_turn");
+}
+
+async Task UnverifiedRemainingQuoteBlocksDelete()
+{
+    await using var world = World.Create(InputModes.C);
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
+    world.Model.AssessOverride = (_, _) => new ThreadAssessment
+    {
+        Summary = "実装を完了した。",
+        Purpose = "",
+        CurrentPosition = "実装を完了した。",
+        ExplicitRemainingWork = "本文に存在しない架空の残作業",
+        RemainingWorkSourceId = "a1",
+        NextAction = "",
+        Uncertainty = "",
+        SelectedPullUrls = ["https://github.com/acme/widgets/pull/7"],
+    };
+    world.Model.ReconcileOverride = (_, _) =>
+        [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:sess"])];
+    var result = await world.Run(true);
+    var thread = world.Store.GetThread("codex", "sess");
+    Check(string.IsNullOrEmpty(thread?.Assessment?.ExplicitRemainingWork), "unverified quote was kept as text");
+    Check(thread?.Assessment?.RemainingWorkUnverified == true, "RemainingWorkUnverified was not set");
+    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "unverified quote allowed workstream deletion");
+    Check(!world.CardText().Contains("架空の残作業", StringComparison.Ordinal), "unverified quote was written to ledger");
+    Check(File.ReadAllText(result.TracePath!).Contains("guard_rejected_unverified_remaining_quote", StringComparison.Ordinal), "trace missed guard_rejected_unverified_remaining_quote");
+}
+
+async Task ToolOutputSignalAndIssueIsolation()
+{
+    await using var world = World.Create(InputModes.C);
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("Issue #15 と https://github.com/acme/widgets/issues/15 を解決して。"),
+        LogText.ToolOutput("Assert.Equal(\"https://github.com/myorg/myrepo/pull/42\", actual);"),
+        LogText.ToolOutput("gh pr create\nhttps://github.com/acme/widgets/pull/7\n34 passed"),
+        LogText.Assistant("Issue #15 の実装を完了した。", "final_answer"));
+    world.Model.AssessOverride = (_, user) =>
+    {
+        Check(user.Contains("[sig1 ", StringComparison.Ordinal) && user.Contains("34 passed", StringComparison.Ordinal), "actionable tool signal was not sent in Mode C");
+        Check(!user.Contains("myorg/myrepo/pull/42", StringComparison.Ordinal), "code fixture URL leaked into signals");
+        Check(user.Contains("https://github.com/acme/widgets/pull/7", StringComparison.Ordinal), "PR URL from tool output was not in pullCandidates");
+        Check(!user.Contains("https://github.com/acme/widgets/pull/15", StringComparison.Ordinal), "Issue #15 was turned into pull/15 candidate");
+        return new ThreadAssessment
+        {
+            Summary = "Issue #15 の実装を完了した。",
+            Purpose = "",
+            CurrentPosition = "Issue #15 の実装を完了した。",
+            ExplicitRemainingWork = "",
+            NextAction = "",
+            Uncertainty = "",
+            SelectedPullUrls = ["https://github.com/acme/widgets/pull/7"],
+        };
+    };
+    var result = await world.Run(true);
+    Check(result.SkippedRecords.Count == 0, "Issue #15 or fixture URL caused a pull lookup failure");
+    Check(!world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "PR from tool output did not complete the workstream");
+}
+
+async Task MultiCardDisambiguationAndHoldCodes()
+{
+    await using var world = World.Create(InputModes.C);
+    world.WriteCard(OneCard("https://github.com/acme/widgets/issues/15"));
+    var inactivePath = Path.Combine(world.Ledger, "projects", "widgets-archive.md");
+    File.WriteAllText(
+        inactivePath,
+        """
+        ---
+        status: active
+        repositories:
+          - acme/widgets
+        ---
+
+        # Widgets Legacy
+
+        ## 目的
+
+        過去の移行。
+
+        ## 現在地
+
+        完了済み。
+
+        ## 進行中のworkstream
+
+        （なし）
+        """,
+        World.FileEncoding);
+    LedgerGit.Run(world.Ledger, ["add", "--", "projects/widgets-archive.md"]);
+    LedgerGit.Run(world.Ledger, ["commit", "-m", "add archive card"]);
+
+    world.WriteRollout(
+        "matched",
+        "https://github.com/acme/widgets",
+        LogText.User("Issue #15 のウィジェット修正を進めて。"),
+        LogText.Assistant("ウィジェット修正の実装を開始した。", "final_answer"));
+    world.WriteRollout(
+        "zero-card",
+        "https://github.com/acme/no-such-repo",
+        LogText.User("未登録リポジトリの作業。"),
+        LogText.Assistant("未登録リポジトリの実装を開始した。", "final_answer"));
+    var result = await world.Run(true);
+    var trace = File.ReadAllText(result.TracePath!);
+    Check(trace.Contains("matched_by_card_context", StringComparison.Ordinal), "multi-card repository was not disambiguated by card context");
+    Check(trace.Contains("hold_no_project_candidate", StringComparison.Ordinal), "0-candidate hold code was not recorded");
+    Check(world.CardText().Contains("ウィジェット修正の実装を開始した。", StringComparison.Ordinal), "disambiguated card was not updated");
+}
+
+async Task StageDiagnosticsAndTraceJson()
+{
+    await using var world = World.Create(InputModes.C);
+    world.WriteCard(TwoCard(null));
+    world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
+    var huge = new string('あ', Normalize.StoredBodyLimit + 100);
+    world.WriteRollout(
+        "truncated-sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant(huge + " 実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:20:00Z"));
+    world.WriteRollout(
+        "unselected-sess",
+        "https://github.com/acme/widgets",
+        LogText.User("文書整理の確認。"),
+        LogText.Assistant("文書整理の調査をした。", "final_answer", "2026-11-01T00:30:00Z"));
+    world.WriteRollout(
+        "no-resp",
+        "https://github.com/acme/widgets",
+        LogText.User("応答なし。"));
+    world.Model.ReconcileOverride = (_, _) =>
+        [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:truncated-sess"])];
+    var result = await world.Run(false);
+    Check(!string.IsNullOrEmpty(result.TracePath) && File.Exists(result.TracePath!), "trace.json was not written");
+    var trace = File.ReadAllText(result.TracePath!);
+    Check(trace.Contains("no_normal_response", StringComparison.Ordinal), "pre-selection no_normal_response missing from trace");
+    Check(trace.Contains("guard_rejected_body_truncated", StringComparison.Ordinal), "truncation guard missing from trace");
+    Check(trace.Contains("codex:unselected-sess", StringComparison.Ordinal), "unselected report id missing from trace");
+    var report = File.ReadAllText(result.ReportPath);
+    Check(report.Contains("## 段階別診断", StringComparison.Ordinal), "stage diagnostics section missing from report");
+    Check(report.Contains("reconcile_report_unselected_no_reason", StringComparison.Ordinal), "unselected report warning missing from report");
+}
+
+async Task FingerprintInvalidationAcrossModes()
+{
+    await using var world = World.Create(InputModes.A);
+    world.WriteCard(OneCard("なし。"));
+    world.WriteRollout(
+        "sess",
+        "https://github.com/acme/widgets",
+        LogText.User("ウィジェットを直して。"),
+        LogText.Assistant("途中の回答。", "final_answer", "2026-11-01T00:15:00Z"),
+        LogText.User("追加の質問。"),
+        LogText.Assistant("計画のみで、実装はしていない。", "final_answer", "2026-11-01T00:20:00Z"));
+    await world.Run(false);
+    var callsAfterA = world.Model.Payloads.Count(p => p.Contains("pullCandidates:", StringComparison.Ordinal));
+    Check(callsAfterA == 1, "Mode A did not call assess");
+    await world.Run(false);
+    Check(world.Model.Payloads.Count(p => p.Contains("pullCandidates:", StringComparison.Ordinal)) == callsAfterA, "same mode re-called assess");
+    world.Config = new AppConfig
+    {
+        StateDirectory = world.Config.StateDirectory,
+        CodexSessionsDir = world.Config.CodexSessionsDir,
+        CodexArchivedSessionsDir = world.Config.CodexArchivedSessionsDir,
+        LedgerRepository = world.Config.LedgerRepository,
+        Model = world.Config.Model,
+        ReasoningEffort = world.Config.ReasoningEffort,
+        InputMode = InputModes.C,
+        MaxParallel = world.Config.MaxParallel,
+        MaxRetries = world.Config.MaxRetries,
+    };
+    await world.Run(false);
+    Check(world.Model.Payloads.Count(p => p.Contains("pullCandidates:", StringComparison.Ordinal)) == callsAfterA + 1, "switching InputMode from A to C did not invalidate assessment cache");
+}
+
 static void Check(bool condition, string message)
 {
     if (!condition)
@@ -1116,6 +1408,19 @@ internal static class LogText
         }.ToJsonString();
     }
 
+    internal static string ToolOutput(string output, string timestamp = "2026-11-01T00:16:00Z") =>
+        new JsonObject
+        {
+            ["timestamp"] = timestamp,
+            ["type"] = "response_item",
+            ["payload"] = new JsonObject
+            {
+                ["type"] = "function_call_output",
+                ["call_id"] = "call-2",
+                ["output"] = output,
+            },
+        }.ToJsonString();
+
     internal static string Event(string type) =>
         new JsonObject
         {
@@ -1158,7 +1463,7 @@ internal sealed class World : IAsyncDisposable
     private static readonly DateTimeOffset Now = new(2026, 11, 1, 12, 0, 0, TimeSpan.Zero);
 
     internal required string Root { get; init; }
-    internal required AppConfig Config { get; init; }
+    internal required AppConfig Config { get; set; }
     internal required StateStore Store { get; init; }
     internal required ScriptedModel Model { get; init; }
     internal required FakePulls Pulls { get; init; }
@@ -1167,7 +1472,7 @@ internal sealed class World : IAsyncDisposable
     internal static TimeWindow Day(int day) =>
         TimeWindow.FromDates(new DateOnly(2026, 11, day), new DateOnly(2026, 11, day), TimeZoneInfo.Utc);
 
-    internal static World Create()
+    internal static World Create(string? inputMode = null)
     {
         var root = Path.Combine(Path.GetTempPath(), "status-check-" + Guid.NewGuid().ToString("N"));
         var config = new AppConfig
@@ -1178,6 +1483,7 @@ internal sealed class World : IAsyncDisposable
             LedgerRepository = Path.Combine(root, "ledger"),
             Model = "scripted",
             ReasoningEffort = "medium",
+            InputMode = inputMode ?? InputModes.Default,
             MaxParallel = 1,
             MaxRetries = 1,
         };
@@ -1285,6 +1591,8 @@ internal sealed class World : IAsyncDisposable
 internal sealed class ScriptedModel : IActivityModel
 {
     internal List<string> Payloads { get; } = [];
+    internal Func<string, string, ThreadAssessment>? AssessOverride { get; set; }
+    internal Func<string, string, IReadOnlyList<LedgerFieldUpdate>>? ReconcileOverride { get; set; }
 
     public Task<ThreadAssessment> AssessAsync(string system, string user, CancellationToken cancellationToken)
     {
@@ -1292,6 +1600,11 @@ internal sealed class ScriptedModel : IActivityModel
         if (user.Contains("FAIL_MODEL", StringComparison.Ordinal))
         {
             throw new StatusCheckException("scripted model failure");
+        }
+
+        if (AssessOverride is not null)
+        {
+            return Task.FromResult(AssessOverride(system, user));
         }
 
         var response = Section(user, "response");
@@ -1313,6 +1626,11 @@ internal sealed class ScriptedModel : IActivityModel
         if (user.Contains("FAIL_RECONCILE", StringComparison.Ordinal))
         {
             throw new StatusCheckException("scripted reconcile failure");
+        }
+
+        if (ReconcileOverride is not null)
+        {
+            return Task.FromResult(ReconcileOverride(system, user));
         }
 
         if (!user.Contains("### ウィジェット修正", StringComparison.Ordinal) || user.Contains("導入作業", StringComparison.Ordinal))
