@@ -135,10 +135,18 @@ internal sealed class StateStore : IDisposable
               matched_workstream TEXT,
               reconcile_fingerprint TEXT,
               input_version INTEGER NOT NULL,
+              turns_json TEXT NOT NULL DEFAULT '[]',
+              signals_json TEXT NOT NULL DEFAULT '[]',
+              refs_json TEXT NOT NULL DEFAULT '[]',
+              truncated INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY (source, native_id)
             );
             """);
         EnsureColumn("files", "scan_version", "INTEGER NOT NULL DEFAULT 0");
+        EnsureColumn("threads", "turns_json", "TEXT NOT NULL DEFAULT '[]'");
+        EnsureColumn("threads", "signals_json", "TEXT NOT NULL DEFAULT '[]'");
+        EnsureColumn("threads", "refs_json", "TEXT NOT NULL DEFAULT '[]'");
+        EnsureColumn("threads", "truncated", "INTEGER NOT NULL DEFAULT 0");
         SetMeta("input_model_version", Normalize.InputModelVersion.ToString(CultureInfo.InvariantCulture));
     }
 
@@ -517,13 +525,15 @@ internal sealed class StateStore : IDisposable
                   request_text, request_at, request_ordinal, request_basis,
                   response_text, response_at, response_ordinal, response_basis,
                   first_event_utc, last_event_utc, fingerprint, assessment_json,
-                  matched_path, matched_workstream, reconcile_fingerprint, input_version)
+                  matched_path, matched_workstream, reconcile_fingerprint, input_version,
+                  turns_json, signals_json, refs_json, truncated)
                 VALUES (
                   $source, $native, $path, $repo, $cwd,
                   $request, $requestAt, $requestOrdinal, $requestBasis,
                   $response, $responseAt, $responseOrdinal, $responseBasis,
                   $first, $last, $fingerprint, $assessment,
-                  $matchedPath, $matchedWorkstream, $reconcile, $version)
+                  $matchedPath, $matchedWorkstream, $reconcile, $version,
+                  $turns, $signals, $refs, $truncated)
                 ON CONFLICT(source, native_id) DO UPDATE SET
                   file_path = excluded.file_path,
                   repository = excluded.repository,
@@ -543,7 +553,11 @@ internal sealed class StateStore : IDisposable
                   matched_path = excluded.matched_path,
                   matched_workstream = excluded.matched_workstream,
                   reconcile_fingerprint = excluded.reconcile_fingerprint,
-                  input_version = excluded.input_version
+                  input_version = excluded.input_version,
+                  turns_json = excluded.turns_json,
+                  signals_json = excluded.signals_json,
+                  refs_json = excluded.refs_json,
+                  truncated = excluded.truncated
                 """;
             BindThread(command, thread);
             command.ExecuteNonQuery();
@@ -743,7 +757,8 @@ internal sealed class StateStore : IDisposable
                request_text, request_at, request_ordinal, request_basis,
                response_text, response_at, response_ordinal, response_basis,
                first_event_utc, last_event_utc, fingerprint, assessment_json,
-               matched_path, matched_workstream, reconcile_fingerprint, input_version
+               matched_path, matched_workstream, reconcile_fingerprint, input_version,
+               turns_json, signals_json, refs_json, truncated
         FROM threads
         """;
 
@@ -770,6 +785,10 @@ internal sealed class StateStore : IDisposable
         command.Parameters.AddWithValue("$matchedWorkstream", (object?)thread.MatchedWorkstream ?? DBNull.Value);
         command.Parameters.AddWithValue("$reconcile", (object?)thread.ReconcileFingerprint ?? DBNull.Value);
         command.Parameters.AddWithValue("$version", Normalize.InputModelVersion);
+        command.Parameters.AddWithValue("$turns", SerializeTurns(thread.Turns));
+        command.Parameters.AddWithValue("$signals", SerializeSignals(thread.Signals));
+        command.Parameters.AddWithValue("$refs", SerializeExtractedRefs(thread.ExtractedRefs));
+        command.Parameters.AddWithValue("$truncated", thread.Truncated ? 1 : 0);
     }
 
     private static ThreadRecord ReadThread(SqliteDataReader reader)
@@ -790,7 +809,181 @@ internal sealed class StateStore : IDisposable
             MatchedPath = reader.IsDBNull(17) ? null : reader.GetString(17),
             MatchedWorkstream = reader.IsDBNull(18) ? null : reader.GetString(18),
             ReconcileFingerprint = reader.IsDBNull(19) ? null : reader.GetString(19),
+            Turns = reader.IsDBNull(21) ? [] : ReadTurns(reader.GetString(21)),
+            Signals = reader.IsDBNull(22) ? [] : ReadSignals(reader.GetString(22)),
+            ExtractedRefs = reader.IsDBNull(23) ? [] : ReadExtractedRefs(reader.GetString(23)),
+            Truncated = !reader.IsDBNull(24) && reader.GetInt64(24) != 0,
         };
+    }
+
+    private static string SerializeTurns(IReadOnlyList<ThreadTurn> turns)
+    {
+        var array = new JsonArray();
+        foreach (var turn in turns)
+        {
+            JsonLists.AddObject(array, new JsonObject
+            {
+                ["turnId"] = turn.TurnId,
+                ["role"] = turn.Role,
+                ["text"] = turn.Text,
+                ["timestamp"] = turn.Timestamp is null ? null : FormatTime(turn.Timestamp.Value),
+                ["ordinal"] = turn.Ordinal,
+                ["basis"] = turn.Basis,
+                ["truncated"] = turn.Truncated,
+            });
+        }
+
+        return array.ToJsonString();
+    }
+
+    private static IReadOnlyList<ThreadTurn> ReadTurns(string json)
+    {
+        try
+        {
+            var array = JsonNode.Parse(json) as JsonArray;
+            var turns = new List<ThreadTurn>();
+            if (array is null)
+            {
+                return turns;
+            }
+
+            foreach (var node in array)
+            {
+                if (node is not JsonObject obj)
+                {
+                    continue;
+                }
+
+                turns.Add(new ThreadTurn(
+                    obj["turnId"]?.GetValue<string>() ?? "",
+                    obj["role"]?.GetValue<string>() ?? "",
+                    obj["text"]?.GetValue<string>() ?? "",
+                    obj["timestamp"] is JsonNode ts && ts.GetValueKind() == JsonValueKind.String ? ParseTime(ts.GetValue<string>()) : null,
+                    obj["ordinal"]?.GetValue<long>() ?? 0L,
+                    obj["basis"]?.GetValue<string>() ?? "",
+                    obj["truncated"]?.GetValue<bool>() ?? false));
+            }
+
+            return turns;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static string SerializeSignals(IReadOnlyList<SignalExcerpt> signals)
+    {
+        var array = new JsonArray();
+        foreach (var signal in signals)
+        {
+            JsonLists.AddObject(array, new JsonObject
+            {
+                ["signalId"] = signal.SignalId,
+                ["sourceKind"] = signal.SourceKind,
+                ["toolName"] = signal.ToolName,
+                ["text"] = signal.Text,
+                ["timestamp"] = signal.Timestamp is null ? null : FormatTime(signal.Timestamp.Value),
+                ["ordinal"] = signal.Ordinal,
+                ["truncated"] = signal.Truncated,
+            });
+        }
+
+        return array.ToJsonString();
+    }
+
+    private static IReadOnlyList<SignalExcerpt> ReadSignals(string json)
+    {
+        try
+        {
+            var array = JsonNode.Parse(json) as JsonArray;
+            var signals = new List<SignalExcerpt>();
+            if (array is null)
+            {
+                return signals;
+            }
+
+            foreach (var node in array)
+            {
+                if (node is not JsonObject obj)
+                {
+                    continue;
+                }
+
+                signals.Add(new SignalExcerpt(
+                    obj["signalId"]?.GetValue<string>() ?? "",
+                    obj["sourceKind"]?.GetValue<string>() ?? "",
+                    obj["toolName"]?.GetValue<string>() ?? "",
+                    obj["text"]?.GetValue<string>() ?? "",
+                    obj["timestamp"] is JsonNode ts && ts.GetValueKind() == JsonValueKind.String ? ParseTime(ts.GetValue<string>()) : null,
+                    obj["ordinal"]?.GetValue<long>() ?? 0L,
+                    obj["truncated"]?.GetValue<bool>() ?? false));
+            }
+
+            return signals;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static string SerializeExtractedRefs(IReadOnlyList<ExtractedRef> refs)
+    {
+        var array = new JsonArray();
+        foreach (var item in refs)
+        {
+            JsonLists.AddObject(array, new JsonObject
+            {
+                ["url"] = item.Ref.Url,
+                ["owner"] = item.Ref.Owner,
+                ["repository"] = item.Ref.Repository,
+                ["number"] = item.Ref.Number,
+                ["kind"] = item.Ref.Kind,
+                ["sourceKind"] = item.SourceKind,
+                ["ordinal"] = item.Ordinal,
+            });
+        }
+
+        return array.ToJsonString();
+    }
+
+    private static IReadOnlyList<ExtractedRef> ReadExtractedRefs(string json)
+    {
+        try
+        {
+            var array = JsonNode.Parse(json) as JsonArray;
+            var refs = new List<ExtractedRef>();
+            if (array is null)
+            {
+                return refs;
+            }
+
+            foreach (var node in array)
+            {
+                if (node is not JsonObject obj)
+                {
+                    continue;
+                }
+
+                var gitRef = new GitHubRef(
+                    obj["url"]?.GetValue<string>() ?? "",
+                    obj["owner"]?.GetValue<string>() ?? "",
+                    obj["repository"]?.GetValue<string>() ?? "",
+                    obj["number"]?.GetValue<int>() ?? 0,
+                    obj["kind"]?.GetValue<string>() ?? "pull");
+                refs.Add(new ExtractedRef(
+                    gitRef,
+                    obj["sourceKind"]?.GetValue<string>() ?? "user",
+                    obj["ordinal"]?.GetValue<long>() ?? 0L));
+            }
+
+            return refs;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
     }
 
     /// <summary>

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -9,8 +10,13 @@ using System.Text.RegularExpressions;
 internal static partial class Normalize
 {
     internal const int ExcerptLimit = 4000;
+    internal const int TurnExcerptLimit = 1200;
+    internal const int SignalExcerptLimit = 300;
+    internal const int MaxSignalsPerThread = 8;
+    internal const int MaxIntermediateTurns = 10;
     internal const int StoredBodyLimit = 200_000;
-    internal const int InputModelVersion = 2;
+    internal const int InputModelVersion = 3;
+    internal const string PromptVersion = "v2";
 
     internal static string Sha256Hex(string text)
     {
@@ -23,14 +29,56 @@ internal static partial class Normalize
     internal static string ThreadKey(string source, string nativeId) => source + "\n" + nativeId;
 
     internal static string ObservationId(string path, long ordinal, string kind) =>
-        "obs_" + ShortHash(path + "\n" + ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\n" + kind);
+        "obs_" + ShortHash(path + "\n" + ordinal.ToString(CultureInfo.InvariantCulture) + "\n" + kind);
 
-    internal static string SelectionFingerprint(SelectedExcerpt? request, SelectedExcerpt? response)
+    internal static string SelectionFingerprint(
+        SelectedExcerpt? request,
+        SelectedExcerpt? response,
+        IReadOnlyList<ThreadTurn>? turns = null,
+        IReadOnlyList<SignalExcerpt>? signals = null,
+        IReadOnlyList<ExtractedRef>? refs = null,
+        string? inputMode = null,
+        string? model = null,
+        string? reasoningEffort = null)
     {
-        var joined = InputModelVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            + "\n" + (request?.Text ?? "")
-            + "\n" + (response?.Text ?? "");
-        return Sha256Hex(joined);
+        var mode = InputModes.NormalizeMode(inputMode);
+        var builder = new StringBuilder();
+        builder.Append(InputModelVersion.ToString(CultureInfo.InvariantCulture));
+        builder.Append('\n').Append(PromptVersion);
+        builder.Append('\n').Append(mode);
+        builder.Append('\n').Append(model ?? "");
+        builder.Append('\n').Append(reasoningEffort ?? "");
+        builder.Append('\n').Append(request?.Text ?? "");
+        builder.Append('\n').Append(response?.Text ?? "");
+
+        if (InputModes.UseChronologicalTurns(mode) && turns is not null)
+        {
+            builder.Append("\n--turns--");
+            foreach (var turn in turns)
+            {
+                builder.Append('\n').Append(turn.TurnId).Append(':').Append(turn.Role).Append(':').Append(turn.Text);
+            }
+        }
+
+        if (InputModes.UseSignalExcerpts(mode) && signals is not null)
+        {
+            builder.Append("\n--signals--");
+            foreach (var signal in signals)
+            {
+                builder.Append('\n').Append(signal.SignalId).Append(':').Append(signal.ToolName).Append(':').Append(signal.Text);
+            }
+        }
+
+        if (InputModes.UseImprovedUrlExtraction(mode) && refs is not null)
+        {
+            builder.Append("\n--refs--");
+            foreach (var item in refs)
+            {
+                builder.Append('\n').Append(item.SourceKind).Append(':').Append(item.Ref.Kind).Append(':').Append(item.Ref.Url);
+            }
+        }
+
+        return Sha256Hex(builder.ToString());
     }
 
     /// <summary>
@@ -51,6 +99,11 @@ internal static partial class Normalize
 
     internal static IReadOnlyList<GitHubRef> GitHubRefs(string text)
     {
+        if (string.IsNullOrEmpty(text))
+        {
+            return [];
+        }
+
         var found = new List<GitHubRef>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (Match match in GitHubUrlPattern().Matches(text))
@@ -62,7 +115,7 @@ internal static partial class Normalize
                 continue;
             }
 
-            if (!int.TryParse(match.Groups["num"].Value, System.Globalization.CultureInfo.InvariantCulture, out var number))
+            if (!int.TryParse(match.Groups["num"].Value, CultureInfo.InvariantCulture, out var number))
             {
                 continue;
             }
@@ -75,12 +128,41 @@ internal static partial class Normalize
 
     /// <summary>
     /// 選択済み本文の PR URL と、repository が分かっているときの番号表記を候補にする。
+    /// explicitOnly が true のときは Issue #N や単なる #N を PR 候補に誤変換しない。
     /// </summary>
-    internal static IReadOnlyList<GitHubRef> PullCandidates(string text, string? repository)
+    internal static IReadOnlyList<GitHubRef> PullCandidates(string text, string? repository, bool explicitOnly = true)
     {
+        if (string.IsNullOrEmpty(text))
+        {
+            return [];
+        }
+
         var found = GitHubRefs(text).Where(item => item.Kind == "pull").ToList();
         var seen = found.Select(item => item.Url).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (Match match in RepoPullPattern().Matches(text))
+
+        if (!explicitOnly)
+        {
+            foreach (Match match in RepoPullPattern().Matches(text))
+            {
+                AddPull(found, seen, match.Groups["owner"].Value, match.Groups["repo"].Value, match.Groups["num"].Value);
+            }
+
+            if (!string.IsNullOrWhiteSpace(repository))
+            {
+                var parts = repository.Split('/', 2);
+                if (parts.Length == 2)
+                {
+                    foreach (Match match in HashPullPattern().Matches(text))
+                    {
+                        AddPull(found, seen, parts[0], parts[1], match.Groups["num"].Value);
+                    }
+                }
+            }
+
+            return found;
+        }
+
+        foreach (Match match in ExplicitRepoPullPattern().Matches(text))
         {
             AddPull(found, seen, match.Groups["owner"].Value, match.Groups["repo"].Value, match.Groups["num"].Value);
         }
@@ -90,7 +172,7 @@ internal static partial class Normalize
             var parts = repository.Split('/', 2);
             if (parts.Length == 2)
             {
-                foreach (Match match in HashPullPattern().Matches(text))
+                foreach (Match match in ExplicitHashPullPattern().Matches(text))
                 {
                     AddPull(found, seen, parts[0], parts[1], match.Groups["num"].Value);
                 }
@@ -100,20 +182,63 @@ internal static partial class Normalize
         return found;
     }
 
+    /// <summary>
+    /// 本文中の Issue URL および（repository が分かっているときの）Issue #N 表記を抽出する。
+    /// </summary>
+    internal static IReadOnlyList<GitHubRef> IssueCandidates(string text, string? repository)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return [];
+        }
+
+        var found = GitHubRefs(text).Where(item => item.Kind == "issue").ToList();
+        var seen = found.Select(item => item.Url).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(repository))
+        {
+            var parts = repository.Split('/', 2);
+            if (parts.Length == 2)
+            {
+                foreach (Match match in ExplicitHashIssuePattern().Matches(text))
+                {
+                    AddIssue(found, seen, parts[0], parts[1], match.Groups["num"].Value);
+                }
+            }
+        }
+
+        return found;
+    }
+
     private static void AddPull(List<GitHubRef> found, HashSet<string> seen, string owner, string repo, string numberText)
     {
-        if (!int.TryParse(numberText, System.Globalization.CultureInfo.InvariantCulture, out var number))
+        if (!int.TryParse(numberText, CultureInfo.InvariantCulture, out var number))
         {
             return;
         }
 
-        var url = "https://github.com/" + owner + "/" + repo + "/pull/" + number.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        var url = "https://github.com/" + owner + "/" + repo + "/pull/" + number.ToString(CultureInfo.InvariantCulture);
         if (!seen.Add(url))
         {
             return;
         }
 
         found.Add(new GitHubRef(url, owner, repo, number, "pull"));
+    }
+
+    private static void AddIssue(List<GitHubRef> found, HashSet<string> seen, string owner, string repo, string numberText)
+    {
+        if (!int.TryParse(numberText, CultureInfo.InvariantCulture, out var number))
+        {
+            return;
+        }
+
+        var url = "https://github.com/" + owner + "/" + repo + "/issues/" + number.ToString(CultureInfo.InvariantCulture);
+        if (!seen.Add(url))
+        {
+            return;
+        }
+
+        found.Add(new GitHubRef(url, owner, repo, number, "issue"));
     }
 
     internal static IReadOnlyList<string> RunIds(string text)
@@ -160,6 +285,19 @@ internal static partial class Normalize
         return Redaction.Truncate(redacted.Trim(), ExcerptLimit);
     }
 
+    internal static string TruncateWithFlag(string text, int maxChars, out bool truncated)
+    {
+        var redacted = Redaction.Apply(text).Trim();
+        if (redacted.Length <= maxChars)
+        {
+            truncated = false;
+            return redacted;
+        }
+
+        truncated = true;
+        return redacted[..maxChars];
+    }
+
     internal static IReadOnlyList<string> ResidualHints(string text)
     {
         var hints = new List<string>();
@@ -191,7 +329,7 @@ internal static partial class Normalize
         foreach (var ch in text.Replace("\r\n", "\n", StringComparison.Ordinal))
         {
             current.Append(ch);
-            if (ch is '。' or '\n' or '.' )
+            if (ch is '。' or '\n' or '.')
             {
                 var sentence = current.ToString().Trim();
                 current.Clear();
@@ -285,8 +423,17 @@ internal static partial class Normalize
     [GeneratedRegex(@"(?<owner>[A-Za-z0-9_.-]+)/(?<repo>[A-Za-z0-9_.-]+)#(?<num>\d+)", RegexOptions.CultureInvariant)]
     private static partial Regex RepoPullPattern();
 
+    [GeneratedRegex(@"(?:PR|pull(?:\s+request)?)\s+(?<owner>[A-Za-z0-9_.-]+)/(?<repo>[A-Za-z0-9_.-]+)#(?<num>\d+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex ExplicitRepoPullPattern();
+
     [GeneratedRegex(@"(?:^|\s)#(?<num>\d+)\b", RegexOptions.CultureInvariant)]
     private static partial Regex HashPullPattern();
+
+    [GeneratedRegex(@"\b(?:PR|pull(?:\s+request)?)\s*#(?<num>\d+)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex ExplicitHashPullPattern();
+
+    [GeneratedRegex(@"\bissues?\s*#(?<num>\d+)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex ExplicitHashIssuePattern();
 
     [GeneratedRegex(@"\b(?<id>\d{8}T\d{6}Z-[0-9a-fA-F]{8})\b", RegexOptions.CultureInvariant)]
     private static partial Regex RunIdPattern();

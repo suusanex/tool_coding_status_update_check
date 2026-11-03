@@ -314,6 +314,8 @@ internal sealed class HoldNote
 {
     public required string ActivityId { get; init; }
     public required string Reason { get; init; }
+    public string ReasonCode { get; init; } = "";
+    public IReadOnlyList<string> CandidateCards { get; init; } = [];
 }
 
 internal static class LedgerPlanner
@@ -323,8 +325,35 @@ internal static class LedgerPlanner
     internal static LedgerChange? Apply(
         ProjectCard card,
         IReadOnlyList<ThreadView> reports,
-        IReadOnlyList<LedgerFieldUpdate> updates)
+        IReadOnlyList<LedgerFieldUpdate> updates) =>
+        ApplyWithDiagnostics(card, reports, updates, out _, out _);
+
+    internal static LedgerChange? ApplyWithDiagnostics(
+        ProjectCard card,
+        IReadOnlyList<ThreadView> reports,
+        IReadOnlyList<LedgerFieldUpdate> updates,
+        out IReadOnlyList<WorkstreamDiagnostic> diagnostics,
+        out IReadOnlyList<string> unselectedReportIds)
     {
+        var diagList = new List<WorkstreamDiagnostic>();
+        var selectedIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var update in updates)
+        {
+            if (update.ReportIds is not null)
+            {
+                foreach (var id in update.ReportIds)
+                {
+                    selectedIds.Add(id);
+                }
+            }
+        }
+
+        unselectedReportIds = reports
+            .Select(report => report.Thread.Source + ":" + report.Thread.NativeId)
+            .Where(id => !selectedIds.Contains(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
         var newline = card.Text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
         var edits = new Dictionary<string, (int Start, int Length, string Replacement)>(StringComparer.Ordinal);
         var decisions = new List<LedgerDecision>();
@@ -333,14 +362,35 @@ internal static class LedgerPlanner
         var touched = new HashSet<string>(StringComparer.Ordinal);
         foreach (var update in updates)
         {
-            if (string.IsNullOrWhiteSpace(update.Workstream) || update.Action.Equals("none", StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(update.Workstream))
             {
+                continue;
+            }
+
+            if (update.Action.Equals("none", StringComparison.OrdinalIgnoreCase))
+            {
+                diagList.Add(new WorkstreamDiagnostic(
+                    update.Workstream,
+                    "none",
+                    "reconciled",
+                    "reconcile_action_none",
+                    string.IsNullOrWhiteSpace(update.Reason) ? "モデルが変更不要（action=none）と判断した。" : update.Reason,
+                    update.ReportIds ?? [],
+                    Applied: false));
                 continue;
             }
 
             var slice = card.Workstreams.FirstOrDefault(workstream => workstream.Heading == update.Workstream);
             if (slice is null)
             {
+                diagList.Add(new WorkstreamDiagnostic(
+                    update.Workstream,
+                    update.Action,
+                    "workstream_matched",
+                    "reconcile_workstream_mismatch",
+                    "指定されたworkstream見出し（" + update.Workstream + "）がProjectカードに存在しない。",
+                    update.ReportIds ?? [],
+                    Applied: false));
                 continue;
             }
 
@@ -348,13 +398,30 @@ internal static class LedgerPlanner
             var relevant = ReportsFor(reports, update);
             if (action == "delete")
             {
-                if (!CanDelete(relevant))
+                var guard = CheckDeleteGuard(relevant);
+                if (!guard.Allowed)
                 {
+                    diagList.Add(new WorkstreamDiagnostic(
+                        slice.Heading,
+                        "delete",
+                        "guard_checked",
+                        guard.ReasonCode,
+                        guard.ReasonDetail,
+                        update.ReportIds ?? [],
+                        Applied: false));
                     continue;
                 }
 
                 edits[slice.Heading] = (slice.Start, slice.Length, "");
                 current = CardParser.RewriteCurrent(current ?? card.Current, slice.Current, CompletionFact, newline);
+                diagList.Add(new WorkstreamDiagnostic(
+                    slice.Heading,
+                    "delete",
+                    "proposed",
+                    "guard_passed",
+                    string.IsNullOrWhiteSpace(update.Reason) ? guard.ReasonDetail : update.Reason,
+                    update.ReportIds ?? [],
+                    Applied: true));
             }
             else
             {
@@ -370,8 +437,26 @@ internal static class LedgerPlanner
                     var urls = relevant.SelectMany(report => report.Pulls.Select(pull => pull.Url));
                     if (urls.All(url => slice.References.Contains(url, StringComparison.Ordinal)))
                     {
+                        var noopCode = slice.Current.Length > renderedCurrent.Length
+                            ? "reconcile_noop_richer_existing"
+                            : "reconcile_noop_already_reflected";
+                        diagList.Add(new WorkstreamDiagnostic(
+                            slice.Heading,
+                            "update",
+                            "guard_checked",
+                            noopCode,
+                            "既存の記載に包含されているため変更不要（no-op）。",
+                            update.ReportIds ?? [],
+                            Applied: false));
                         continue;
                     }
+                }
+
+                if (renderedCurrent.Length > 0 &&
+                    slice.Current.Length > renderedCurrent.Length &&
+                    slice.Current.Contains(renderedCurrent, StringComparison.Ordinal))
+                {
+                    renderedCurrent = slice.Current;
                 }
 
                 if (!string.IsNullOrWhiteSpace(latest?.Assessment?.ExplicitRemainingWork))
@@ -385,6 +470,14 @@ internal static class LedgerPlanner
 
                 var references = AppendUrls(slice.References, relevant.SelectMany(report => report.Pulls.Select(pull => pull.Url)), newline);
                 edits[slice.Heading] = (slice.Start, slice.Length, CardParser.RenderWorkstream(slice.Heading, renderedCurrent, renderedNext, renderedWaiting, references, newline));
+                diagList.Add(new WorkstreamDiagnostic(
+                    slice.Heading,
+                    "update",
+                    "proposed",
+                    "update_proposed",
+                    string.IsNullOrWhiteSpace(update.Reason) ? "現在地の差分を反映する。" : update.Reason,
+                    update.ReportIds ?? [],
+                    Applied: true));
             }
 
             touched.Add(slice.Heading);
@@ -405,6 +498,7 @@ internal static class LedgerPlanner
             });
         }
 
+        diagnostics = diagList;
         if (decisions.Count == 0)
         {
             return null;
@@ -452,26 +546,54 @@ internal static class LedgerPlanner
         };
     }
 
-    internal static bool CanDelete(IReadOnlyList<ThreadView> reports)
+    internal static bool CanDelete(IReadOnlyList<ThreadView> reports) =>
+        CheckDeleteGuard(reports).Allowed;
+
+    internal static (bool Allowed, string ReasonCode, string ReasonDetail) CheckDeleteGuard(IReadOnlyList<ThreadView> reports)
     {
         if (reports.Count == 0)
         {
-            return false;
+            return (false, "guard_rejected_no_reports", "判断対象のreportが指定されていないため完了削除しない。");
+        }
+
+        if (reports.Any(report => report.Thread.Truncated))
+        {
+            return (false, "guard_rejected_body_truncated", "対象スレッドの本文が上限で切り詰められているため完了削除しない。");
         }
 
         // 取得できなかった PR があると、見えている PR だけでは完了にできない。
         if (reports.Any(report => report.PullLookupFailed))
         {
-            return false;
+            return (false, "guard_rejected_pr_lookup_failed", "取得できなかったPRがあるため完了削除しない。");
         }
 
         if (reports.Any(report => !string.IsNullOrWhiteSpace(report.Assessment?.ExplicitRemainingWork)))
         {
-            return false;
+            return (false, "guard_rejected_remaining_work", "未解消の明示的な残作業があるため完了削除しない。");
+        }
+
+        if (reports.Any(report => report.Assessment?.RemainingWorkUnverified == true))
+        {
+            return (false, "guard_rejected_unverified_remaining_quote", "残作業の引用元を検証できず判断不能のため完了削除しない。");
+        }
+
+        if (reports.Any(report => report.Thread.HasTrailingUnansweredUserTurn))
+        {
+            return (false, "guard_rejected_unanswered_user_turn", "最後の通常応答後に未応答のユーザー発言があるため完了削除しない。");
         }
 
         var pulls = reports.SelectMany(report => report.Pulls).ToList();
-        return pulls.Count > 0 && pulls.All(pull => pull.State == PullRequestState.Merged);
+        if (pulls.Count == 0)
+        {
+            return (false, "guard_rejected_no_pr", "対応するPRがないため完了削除しない。");
+        }
+
+        if (!pulls.All(pull => pull.State == PullRequestState.Merged))
+        {
+            return (false, "guard_rejected_pr_not_merged", "未マージのPRが残っているため完了削除しない。");
+        }
+
+        return (true, "guard_passed", "関連PRがすべてMergedで未解消の残作業がないため完了削除を許可した。");
     }
 
     /// <summary>
@@ -490,7 +612,10 @@ internal static class LedgerPlanner
     }
 
     private static ThreadView? Latest(IReadOnlyList<ThreadView> reports) =>
-        reports.OrderByDescending(report => report.Thread.Response?.Timestamp ?? DateTimeOffset.MinValue).FirstOrDefault();
+        reports
+            .OrderByDescending(report => report.Thread.Response?.Timestamp ?? DateTimeOffset.MinValue)
+            .ThenByDescending(report => report.Thread.LastEventUtc ?? DateTimeOffset.MinValue)
+            .FirstOrDefault();
 
     private static string LatestActivity(IReadOnlyList<ThreadView> reports)
     {

@@ -35,6 +35,22 @@ internal static class Cli
             var command = args[0];
             var options = ParseOptions(args[1..]);
             var config = AppConfig.LoadOrCreate(options.ConfigPath);
+            if (!string.IsNullOrWhiteSpace(options.InputMode))
+            {
+                config = new AppConfig
+                {
+                    StateDirectory = config.StateDirectory,
+                    CodexSessionsDir = config.CodexSessionsDir,
+                    CodexArchivedSessionsDir = config.CodexArchivedSessionsDir,
+                    LedgerRepository = config.LedgerRepository,
+                    Model = config.Model,
+                    ReasoningEffort = config.ReasoningEffort,
+                    MaxParallel = config.MaxParallel,
+                    MaxRetries = config.MaxRetries,
+                    InputMode = InputModes.NormalizeMode(options.InputMode),
+                };
+            }
+
             if (command == "apply")
             {
                 if (string.IsNullOrWhiteSpace(options.ProposalRunId))
@@ -106,6 +122,11 @@ internal static class Cli
             Console.WriteLine("report: " + result.ReportPath);
         }
 
+        if (!string.IsNullOrWhiteSpace(result.TracePath))
+        {
+            Console.WriteLine("trace: " + result.TracePath);
+        }
+
         if (result.Estimated)
         {
             Console.WriteLine("estimated input tokens: " + result.EstimatedInputTokens.ToString(System.Globalization.CultureInfo.InvariantCulture));
@@ -154,6 +175,7 @@ internal static class Cli
         DateOnly? from = null;
         DateOnly? to = null;
         decimal? maxUsd = null;
+        string? mode = null;
         for (var index = 0; index < args.Length; index++)
         {
             var option = args[index];
@@ -198,12 +220,15 @@ internal static class Cli
 
                     maxUsd = usd;
                     break;
+                case "--mode":
+                    mode = Value();
+                    break;
                 default:
                     throw new StatusCheckException("Unknown option: " + option);
             }
         }
 
-        return new CliOptions(config, proposal, lastDays, from, to, maxUsd);
+        return new CliOptions(config, proposal, lastDays, from, to, maxUsd, mode);
     }
 
     private static DateOnly ParseDate(string text, string option)
@@ -216,5 +241,5 @@ internal static class Cli
         return date;
     }
 
-    private sealed record CliOptions(string? ConfigPath, string? ProposalRunId, int? LastDays, DateOnly? From, DateOnly? To, decimal? MaxUsd);
+    private sealed record CliOptions(string? ConfigPath, string? ProposalRunId, int? LastDays, DateOnly? From, DateOnly? To, decimal? MaxUsd, string? InputMode);
 }
