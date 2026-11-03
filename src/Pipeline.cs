@@ -375,7 +375,13 @@ internal static partial class StatusPipeline
         var refs = selection.ExtractedRefs.Count > 0 || authoritative
             ? selection.ExtractedRefs.ToList()
             : (previous?.ExtractedRefs.ToList() ?? []);
-        var truncated = reqTrunc || respTrunc || turnsTrunc || (!authoritative && (previous?.Truncated ?? false));
+        var truncated = reqTrunc ||
+            respTrunc ||
+            turnsTrunc ||
+            (requestExcerpt?.Truncated ?? false) ||
+            (responseExcerpt?.Truncated ?? false) ||
+            turns.Any(t => t.Truncated) ||
+            (!authoritative && (previous?.Truncated ?? false));
         var fingerprint = Normalize.SelectionFingerprint(
             requestExcerpt,
             responseExcerpt,
@@ -586,7 +592,7 @@ internal static partial class StatusPipeline
                 diag.MatchReasonCode = match.ReasonCode;
                 diag.MatchReasonDetail = match.ReasonDetail;
                 diag.CandidateCardPaths = match.CandidateCards;
-                diag.Stage = "project_matched";
+                diag.Stage = match.Card is null ? "held" : "project_matched";
                 diag.ReasonCode = match.ReasonCode;
                 diag.ReasonDetail = match.ReasonDetail;
             }
@@ -734,6 +740,17 @@ internal static partial class StatusPipeline
                     ReasonDetail = "カードに進行中のworkstreamが存在しない。",
                     ReconcilePrompt = reconcilePrompt,
                 });
+                foreach (var view in views)
+                {
+                    if (threadDiags.TryGetValue(view.Thread.Source + ":" + view.Thread.NativeId, out var tDiag))
+                    {
+                        tDiag.Stage = "reconciled";
+                        tDiag.ReasonCode = "reconcile_no_workstream";
+                        tDiag.ReasonDetail = "カードに進行中のworkstreamが存在しない。";
+                    }
+                }
+
+                continue;
             }
 
             try
@@ -879,6 +896,9 @@ internal static partial class StatusPipeline
                 card.ReasonDetail = "台帳へコミット適用済み。";
                 card.ProposalStatus = "applied";
                 card.CommitSha = commitSha;
+                card.WorkstreamDiagnostics = card.WorkstreamDiagnostics
+                    .Select(ws => ws.Stage == "proposed" ? ws with { Stage = "applied", Applied = true } : ws)
+                    .ToList();
             }
             else
             {
@@ -1004,17 +1024,18 @@ internal static partial class StatusPipeline
             return ("", rawAssessment.RemainingWorkSourceId, false, true);
         }
 
-        if (IsUsageTipAfterCompletion(thread, remaining))
-        {
-            return ("", "", true, false);
-        }
-
         var wantedId = rawAssessment.RemainingWorkSourceId.Trim();
+        var lastAssistantOrdinal = thread.Turns.LastOrDefault(t => t.Role == "assistant")?.Ordinal;
         if (!string.IsNullOrWhiteSpace(wantedId))
         {
             var turn = thread.Turns.FirstOrDefault(t => string.Equals(t.TurnId, wantedId, StringComparison.OrdinalIgnoreCase));
             if (turn is not null && turn.Text.Contains(remaining, StringComparison.Ordinal))
             {
+                if (turn.Role == "assistant" && turn.Ordinal == lastAssistantOrdinal && IsUsageTipAfterCompletion(thread, remaining))
+                {
+                    return ("", "", true, false);
+                }
+
                 if (!IsResolvedInLaterTurn(thread.Turns, turn.Ordinal, remaining))
                 {
                     return (remaining, turn.TurnId, true, false);
@@ -1043,6 +1064,11 @@ internal static partial class StatusPipeline
             var turn = thread.Turns[i];
             if (turn.Text.Contains(remaining, StringComparison.Ordinal))
             {
+                if (turn.Role == "assistant" && turn.Ordinal == lastAssistantOrdinal && IsUsageTipAfterCompletion(thread, remaining))
+                {
+                    return ("", "", true, false);
+                }
+
                 if (!IsResolvedInLaterTurn(thread.Turns, turn.Ordinal, remaining))
                 {
                     return (remaining, turn.TurnId, true, false);
@@ -1054,6 +1080,11 @@ internal static partial class StatusPipeline
 
         if (thread.Response is not null && thread.Response.Text.Contains(remaining, StringComparison.Ordinal))
         {
+            if (IsUsageTipAfterCompletion(thread, remaining))
+            {
+                return ("", "", true, false);
+            }
+
             return (remaining, "response", true, false);
         }
 
@@ -1089,7 +1120,7 @@ internal static partial class StatusPipeline
     }
 
     /// <summary>
-    /// 中間ターンで本来の作業が完了報告された後、別件の使い方質問に対する一般的な案内文（「〜するには〜してください。」）を
+    /// 中間ターンで本来の作業が完了報告された後、別件の使い方質問に対する一般的な案内文（「今後の参考として〜」「--option を指定できる」等）を
     /// 残作業として誤抽出した場合を抑止する。
     /// </summary>
     private static bool IsUsageTipAfterCompletion(ThreadRecord thread, string remaining)
@@ -1099,11 +1130,13 @@ internal static partial class StatusPipeline
             return false;
         }
 
-        if (remaining.Contains("残作業", StringComparison.Ordinal) ||
-            remaining.Contains("残件", StringComparison.Ordinal) ||
-            remaining.Contains("未対応", StringComparison.Ordinal) ||
-            remaining.Contains("未完了", StringComparison.Ordinal) ||
-            remaining.Contains("阻害", StringComparison.Ordinal))
+        string[] remainingObligationTokens =
+        [
+            "残作業", "残件", "未対応", "未完了", "阻害",
+            "本番", "デプロイ", "マイグレーション", "リリース",
+            "反映して", "適用して", "修正して", "更新して", "作成して", "追加して", "削除して", "必要",
+        ];
+        if (remainingObligationTokens.Any(token => remaining.Contains(token, StringComparison.Ordinal)))
         {
             return false;
         }
@@ -1128,25 +1161,38 @@ internal static partial class StatusPipeline
              lastUser.Text.Contains("どのように", StringComparison.Ordinal) ||
              lastUser.Text.Contains("使い方", StringComparison.Ordinal) ||
              lastUser.Text.Contains("方法", StringComparison.Ordinal) ||
-             lastUser.Text.Contains("教えて", StringComparison.Ordinal) ||
-             lastUser.Text.Contains("ですか？", StringComparison.Ordinal) ||
-             lastUser.Text.Contains("でしょうか？", StringComparison.Ordinal));
-        var isTipSentence =
-            remaining.EndsWith("してください。", StringComparison.Ordinal) ||
-            remaining.EndsWith("できる。", StringComparison.Ordinal) ||
-            remaining.EndsWith("できます。", StringComparison.Ordinal) ||
-            remaining.Contains("今後の参考として", StringComparison.Ordinal);
-        return isHowToQuestion && isTipSentence;
+             lastUser.Text.Contains("オプション", StringComparison.Ordinal) ||
+             lastUser.Text.Contains("コマンド", StringComparison.Ordinal) ||
+             lastUser.Text.Contains("教えて", StringComparison.Ordinal));
+        var isOptionalReferenceSentence =
+            remaining.Contains("今後の参考として", StringComparison.Ordinal) ||
+            remaining.Contains("試す場合", StringComparison.Ordinal) ||
+            remaining.Contains("確認したい場合", StringComparison.Ordinal) ||
+            remaining.Contains("--", StringComparison.Ordinal) ||
+            ((remaining.EndsWith("できる。", StringComparison.Ordinal) || remaining.EndsWith("できます。", StringComparison.Ordinal)) &&
+             (remaining.Contains("場合は", StringComparison.Ordinal) || remaining.Contains("には", StringComparison.Ordinal)));
+        return isHowToQuestion && isOptionalReferenceSentence;
     }
 
     private static bool IsResolvedInLaterTurn(IReadOnlyList<ThreadTurn> turns, long sourceOrdinal, string remaining)
     {
+        var subjectTokens = ExtractCardTokens(remaining)
+            .Where(token => token is not ("残作業" or "残件" or "未対応" or "未完了" or "作業" or "対応"))
+            .ToList();
         foreach (var later in turns.Where(t => t.Role == "assistant" && t.Ordinal > sourceOrdinal))
         {
             if (later.Text.Contains("残作業はありません", StringComparison.Ordinal) ||
-                later.Text.Contains("残作業はなし", StringComparison.Ordinal) ||
-                later.Text.Contains("すべて解消", StringComparison.Ordinal) ||
-                later.Text.Contains("すべて完了", StringComparison.Ordinal))
+                later.Text.Contains("残作業はなし", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (subjectTokens.Count > 0 &&
+                subjectTokens.All(token => later.Text.Contains(token, StringComparison.OrdinalIgnoreCase)) &&
+                (later.Text.Contains("完了", StringComparison.Ordinal) ||
+                 later.Text.Contains("解消", StringComparison.Ordinal) ||
+                 later.Text.Contains("反映済", StringComparison.Ordinal) ||
+                 later.Text.Contains("適用済", StringComparison.Ordinal)))
             {
                 return true;
             }
@@ -1474,13 +1520,24 @@ internal static partial class StatusPipeline
         {
             candidateRepos.Add(thread.Repository);
         }
-
-        foreach (var pull in candidates)
+        else
         {
-            var pullRepo = pull.Owner + "/" + pull.Repository;
-            if (!candidateRepos.Contains(pullRepo, StringComparer.OrdinalIgnoreCase))
+            foreach (var pull in candidates)
             {
-                candidateRepos.Add(pullRepo);
+                var pullRepo = pull.Owner + "/" + pull.Repository;
+                if (!candidateRepos.Contains(pullRepo, StringComparer.OrdinalIgnoreCase))
+                {
+                    candidateRepos.Add(pullRepo);
+                }
+            }
+
+            foreach (var issue in issueRefs)
+            {
+                var issueRepo = issue.Owner + "/" + issue.Repository;
+                if (!candidateRepos.Contains(issueRepo, StringComparer.OrdinalIgnoreCase))
+                {
+                    candidateRepos.Add(issueRepo);
+                }
             }
         }
 
@@ -1488,11 +1545,7 @@ internal static partial class StatusPipeline
         {
             var repoCards = !string.IsNullOrWhiteSpace(thread.Repository)
                 ? cards.Where(card => card.Repositories.Contains(thread.Repository, StringComparer.OrdinalIgnoreCase)).ToList()
-                : [];
-            if (repoCards.Count == 0)
-            {
-                repoCards = cards.Where(card => card.Repositories.Any(r => candidateRepos.Contains(r, StringComparer.OrdinalIgnoreCase))).ToList();
-            }
+                : cards.Where(card => card.Repositories.Any(r => candidateRepos.Contains(r, StringComparer.OrdinalIgnoreCase))).ToList();
 
             if (repoCards.Count == 1)
             {
@@ -1811,15 +1864,9 @@ internal static partial class StatusPipeline
         return found;
     }
 
-    private static bool IsCompatibleToolRef(GitHubRef reference, string? threadRepository)
-    {
-        if (string.IsNullOrWhiteSpace(threadRepository))
-        {
-            return reference.Owner is not ("myorg" or "example" or "owner" or "org");
-        }
-
-        return string.Equals(threadRepository, reference.Owner + "/" + reference.Repository, StringComparison.OrdinalIgnoreCase);
-    }
+    private static bool IsCompatibleToolRef(GitHubRef reference, string? threadRepository) =>
+        !string.IsNullOrWhiteSpace(threadRepository) &&
+        string.Equals(threadRepository, reference.Owner + "/" + reference.Repository, StringComparison.OrdinalIgnoreCase);
 
     private static IReadOnlyList<PullRequestSnapshot> ChoosePulls(ThreadRecord thread, IReadOnlyDictionary<string, PullRequestSnapshot> snapshots, string? inputMode = null)
     {

@@ -1068,15 +1068,17 @@ async Task UnverifiedRemainingQuoteBlocksDelete()
     world.WriteRollout(
         "sess",
         "https://github.com/acme/widgets",
-        LogText.User("ウィジェットを直して。"),
-        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer"));
+        LogText.User("ウィジェットを直して。", "2026-11-01T00:11:00Z"),
+        LogText.Assistant("実装を完了した。 https://github.com/acme/widgets/pull/7", "final_answer", "2026-11-01T00:15:00Z"),
+        LogText.User("ローカルで実行するときのオプションを教えて。", "2026-11-01T00:18:00Z"),
+        LogText.Assistant("ヘルプを確認した。", "final_answer", "2026-11-01T00:20:00Z"));
     world.Model.AssessOverride = (_, _) => new ThreadAssessment
     {
         Summary = "実装を完了した。",
         Purpose = "",
         CurrentPosition = "実装を完了した。",
-        ExplicitRemainingWork = "本文に存在しない架空の残作業",
-        RemainingWorkSourceId = "a1",
+        ExplicitRemainingWork = "今後の参考として、本文に存在しない架空の --fake オプションを指定できる。",
+        RemainingWorkSourceId = "a2",
         NextAction = "",
         Uncertainty = "",
         SelectedPullUrls = ["https://github.com/acme/widgets/pull/7"],
@@ -1088,7 +1090,7 @@ async Task UnverifiedRemainingQuoteBlocksDelete()
     Check(string.IsNullOrEmpty(thread?.Assessment?.ExplicitRemainingWork), "unverified quote was kept as text");
     Check(thread?.Assessment?.RemainingWorkUnverified == true, "RemainingWorkUnverified was not set");
     Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "unverified quote allowed workstream deletion");
-    Check(!world.CardText().Contains("架空の残作業", StringComparison.Ordinal), "unverified quote was written to ledger");
+    Check(!world.CardText().Contains("架空の", StringComparison.Ordinal), "unverified quote was written to ledger");
     Check(File.ReadAllText(result.TracePath!).Contains("guard_rejected_unverified_remaining_quote", StringComparison.Ordinal), "trace missed guard_rejected_unverified_remaining_quote");
 }
 
@@ -1102,13 +1104,13 @@ async Task ToolOutputSignalAndIssueIsolation()
         "https://github.com/acme/widgets",
         LogText.User("Issue #15 と https://github.com/acme/widgets/issues/15 を解決して。"),
         LogText.ToolOutput("Assert.Equal(\"https://github.com/myorg/myrepo/pull/42\", actual);"),
-        LogText.ToolOutput("gh pr create\nhttps://github.com/acme/widgets/pull/7\n34 passed"),
+        LogText.ToolOutput("{\"url\":\"https://github.com/acme/widgets/pull/7\"}\n34 passed"),
         LogText.Assistant("Issue #15 の実装を完了した。", "final_answer"));
     world.Model.AssessOverride = (_, user) =>
     {
         Check(user.Contains("[sig1 ", StringComparison.Ordinal) && user.Contains("34 passed", StringComparison.Ordinal), "actionable tool signal was not sent in Mode C");
         Check(!user.Contains("myorg/myrepo/pull/42", StringComparison.Ordinal), "code fixture URL leaked into signals");
-        Check(user.Contains("https://github.com/acme/widgets/pull/7", StringComparison.Ordinal), "PR URL from tool output was not in pullCandidates");
+        Check(user.Contains("https://github.com/acme/widgets/pull/7", StringComparison.Ordinal), "PR URL from structured JSON tool output was not in pullCandidates");
         Check(!user.Contains("https://github.com/acme/widgets/pull/15", StringComparison.Ordinal), "Issue #15 was turned into pull/15 candidate");
         return new ThreadAssessment
         {
@@ -1180,7 +1182,7 @@ async Task StageDiagnosticsAndTraceJson()
     await using var world = World.Create(InputModes.C);
     world.WriteCard(TwoCard(null));
     world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 11, 1, 1, 0, 0, TimeSpan.Zero));
-    var huge = new string('あ', Normalize.StoredBodyLimit + 100);
+    var huge = new string('あ', Normalize.ExcerptLimit + 200);
     world.WriteRollout(
         "truncated-sess",
         "https://github.com/acme/widgets",

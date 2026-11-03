@@ -866,7 +866,7 @@ internal sealed class StateStore : IDisposable
 
             return turns;
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
             return [];
         }
@@ -922,7 +922,7 @@ internal sealed class StateStore : IDisposable
 
             return signals;
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
             return [];
         }
@@ -980,7 +980,7 @@ internal sealed class StateStore : IDisposable
 
             return refs;
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
             return [];
         }

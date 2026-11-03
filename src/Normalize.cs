@@ -56,7 +56,13 @@ internal static partial class Normalize
             builder.Append("\n--turns--");
             foreach (var turn in turns)
             {
-                builder.Append('\n').Append(turn.TurnId).Append(':').Append(turn.Role).Append(':').Append(turn.Text);
+                builder.Append('\n')
+                    .Append(turn.TurnId).Append(':')
+                    .Append(turn.Role).Append(':')
+                    .Append(turn.Ordinal.ToString(CultureInfo.InvariantCulture)).Append(':')
+                    .Append(turn.Timestamp is null ? "" : StateStore.FormatTime(turn.Timestamp.Value)).Append(':')
+                    .Append(turn.Truncated ? "1:" : "0:")
+                    .Append(turn.Text);
             }
         }
 
@@ -65,7 +71,14 @@ internal static partial class Normalize
             builder.Append("\n--signals--");
             foreach (var signal in signals)
             {
-                builder.Append('\n').Append(signal.SignalId).Append(':').Append(signal.ToolName).Append(':').Append(signal.Text);
+                builder.Append('\n')
+                    .Append(signal.SignalId).Append(':')
+                    .Append(signal.SourceKind).Append(':')
+                    .Append(signal.ToolName).Append(':')
+                    .Append(signal.Ordinal.ToString(CultureInfo.InvariantCulture)).Append(':')
+                    .Append(signal.Timestamp is null ? "" : StateStore.FormatTime(signal.Timestamp.Value)).Append(':')
+                    .Append(signal.Truncated ? "1:" : "0:")
+                    .Append(signal.Text);
             }
         }
 

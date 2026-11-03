@@ -421,7 +421,7 @@ internal static class LedgerPlanner
                     "guard_passed",
                     string.IsNullOrWhiteSpace(update.Reason) ? guard.ReasonDetail : update.Reason,
                     update.ReportIds ?? [],
-                    Applied: true));
+                    Applied: false));
             }
             else
             {
@@ -477,7 +477,7 @@ internal static class LedgerPlanner
                     "update_proposed",
                     string.IsNullOrWhiteSpace(update.Reason) ? "現在地の差分を反映する。" : update.Reason,
                     update.ReportIds ?? [],
-                    Applied: true));
+                    Applied: false));
             }
 
             touched.Add(slice.Heading);
@@ -556,7 +556,7 @@ internal static class LedgerPlanner
             return (false, "guard_rejected_no_reports", "判断対象のreportが指定されていないため完了削除しない。");
         }
 
-        if (reports.Any(report => report.Thread.Truncated))
+        if (reports.Any(report => ThreadPrompts.IsPromptTruncated(report.Thread)))
         {
             return (false, "guard_rejected_body_truncated", "対象スレッドの本文が上限で切り詰められているため完了削除しない。");
         }
