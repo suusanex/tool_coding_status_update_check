@@ -146,7 +146,7 @@ internal static class CodexCollector
             }
 
             selection.AddTurn("user", substantive, timestamp, line.Number, "response_item user message");
-            selection.AddRefs(substantive, "user", line.Number);
+            selection.AddRefs(StripCodeLines(substantive), "user", line.Number);
             return;
         }
 
@@ -158,7 +158,7 @@ internal static class CodexCollector
         var phase = StringProp(payload, "phase");
         if (phase.Equals("commentary", StringComparison.OrdinalIgnoreCase))
         {
-            selection.AddRefs(text, "commentary", line.Number);
+            selection.AddRefs(StripCodeLines(text), "commentary", line.Number);
             return;
         }
 
@@ -176,7 +176,7 @@ internal static class CodexCollector
         var basis = phase.Length == 0 ? "response_item assistant message" : "response_item final_answer";
         selection.Response = new SelectedExcerpt(answer, timestamp, line.Number, basis);
         selection.AddTurn("assistant", answer, timestamp, line.Number, basis);
-        selection.AddRefs(answer, "assistant", line.Number);
+        selection.AddRefs(StripCodeLines(answer), "assistant", line.Number);
     }
 
     private static void ReadToolCall(JsonElement payload, CodexSelection selection)
@@ -209,17 +209,22 @@ internal static class CodexCollector
             return;
         }
 
-        var nonCodeLines = output
-            .Replace("\r\n", "\n", StringComparison.Ordinal)
-            .Replace('\r', '\n')
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(l => !IsCodeOrFixtureLine(l));
-        selection.AddRefs(string.Join("\n", nonCodeLines), "tool", line.Number);
+        selection.AddRefs(StripCodeLines(output), "tool", line.Number);
         var signalText = ExtractActionableSignal(output);
         if (signalText is not null)
         {
             selection.AddSignal("tool_output", toolName, signalText, timestamp, line.Number);
         }
+    }
+
+    private static string StripCodeLines(string text)
+    {
+        var nonCodeLines = text
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(l => !IsCodeOrFixtureLine(l));
+        return string.Join("\n", nonCodeLines);
     }
 
     /// <summary>
@@ -270,9 +275,11 @@ internal static class CodexCollector
     private static bool IsCodeOrFixtureLine(string line) =>
         line.Contains("Assert.", StringComparison.Ordinal) ||
         line.Contains("Check(", StringComparison.Ordinal) ||
-        line.Contains("\"https://", StringComparison.OrdinalIgnoreCase) ||
-        line.Contains("'https://", StringComparison.OrdinalIgnoreCase) ||
-        line.StartsWith("//", StringComparison.Ordinal);
+        line.Contains("const string ", StringComparison.Ordinal) ||
+        line.StartsWith("//", StringComparison.Ordinal) ||
+        (line.EndsWith(");", StringComparison.Ordinal) &&
+         (line.Contains("\"https://", StringComparison.OrdinalIgnoreCase) ||
+          line.Contains("'https://", StringComparison.OrdinalIgnoreCase)));
 
     private static bool IsSignalLine(string line) =>
         line.Contains("https://github.com/", StringComparison.OrdinalIgnoreCase) ||

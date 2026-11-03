@@ -317,8 +317,12 @@ internal static class ThreadPrompts
         return builder.ToString();
     }
 
-    internal static IReadOnlyList<ThreadTurn> SelectTurnsForPrompt(IReadOnlyList<ThreadTurn> allTurns)
+    internal static IReadOnlyList<ThreadTurn> SelectTurnsForPrompt(IReadOnlyList<ThreadTurn> allTurns) =>
+        SelectTurnsForPrompt(allTurns, out _);
+
+    internal static IReadOnlyList<ThreadTurn> SelectTurnsForPrompt(IReadOnlyList<ThreadTurn> allTurns, out bool omittedOrTruncated)
     {
+        omittedOrTruncated = false;
         if (allTurns.Count == 0)
         {
             return [];
@@ -335,6 +339,7 @@ internal static class ThreadPrompts
             }
         }
 
+        var omittedBeforeCurrent = false;
         for (var i = 0; i < allTurns.Count; i++)
         {
             var isFirst = i == 0;
@@ -345,16 +350,56 @@ internal static class ThreadPrompts
                 var startIntermediate = Math.Max(1, (lastAssistantIndex > 0 ? lastAssistantIndex : allTurns.Count) - Normalize.MaxIntermediateTurns);
                 if (i < startIntermediate)
                 {
+                    omittedOrTruncated = true;
+                    omittedBeforeCurrent = true;
                     continue;
                 }
             }
 
             var limit = (isFirst || isLastAssistant || isTrailingUser) ? Normalize.ExcerptLimit : Normalize.TurnExcerptLimit;
             var text = Normalize.TruncateWithFlag(allTurns[i].Text, limit, out var truncated);
-            result.Add(allTurns[i] with { Text = text, Truncated = allTurns[i].Truncated || truncated });
+            var isTruncated = allTurns[i].Truncated || truncated || omittedBeforeCurrent;
+            omittedBeforeCurrent = false;
+            if (isTruncated)
+            {
+                omittedOrTruncated = true;
+            }
+
+            result.Add(allTurns[i] with { Text = text, Truncated = isTruncated });
         }
 
         return result;
+    }
+
+    internal static bool IsPromptTruncated(ThreadRecord thread, string? inputMode = null)
+    {
+        if (thread.Truncated ||
+            (thread.Request?.Truncated ?? false) ||
+            (thread.Response?.Truncated ?? false))
+        {
+            return true;
+        }
+
+        if (thread.Request is not null && Normalize.Excerpt(thread.Request.Text).Length < Redaction.Apply(thread.Request.Text).Trim().Length)
+        {
+            return true;
+        }
+
+        if (thread.Response is not null && Normalize.Excerpt(thread.Response.Text).Length < Redaction.Apply(thread.Response.Text).Trim().Length)
+        {
+            return true;
+        }
+
+        if (InputModes.UseChronologicalTurns(inputMode ?? InputModes.Default))
+        {
+            _ = SelectTurnsForPrompt(thread.Turns, out var turnsOmittedOrTruncated);
+            if (turnsOmittedOrTruncated)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal static string ReconcileUser(ProjectCard card, IReadOnlyList<ThreadView> reports, string? inputMode = null)
