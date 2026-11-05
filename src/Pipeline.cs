@@ -53,6 +53,7 @@ internal static partial class StatusPipeline
             var staged = StampBlobs(request.Config.LedgerRepository, plan.Changes);
             proposalPath = WriteProposal(request.Config, runId, staged);
             var applied = new List<string>();
+            string? applicationReceiptPath = null;
             string? stop = null;
             var exit = 0;
             string? commitSha = null;
@@ -63,6 +64,7 @@ internal static partial class StatusPipeline
                     var commitResult = CommitChangesWithSha(request.Config.LedgerRepository, staged, request.Store, runId);
                     applied.AddRange(commitResult.AppliedPaths);
                     commitSha = commitResult.CommitSha;
+                    if (applied.Count > 0) applicationReceiptPath = WriteApplicationReceipt(request.Config, runId, applied, commitSha);
                 }
                 catch (StatusCheckException ex)
                 {
@@ -83,6 +85,7 @@ internal static partial class StatusPipeline
                 TracePath = tracePath,
                 Trace = plan.Trace,
                 AppliedCards = applied,
+                ApplicationReceiptPath = applicationReceiptPath,
                 StopReason = stop,
                 ExitCode = exit,
                 SkippedLogs = skips,
@@ -148,8 +151,9 @@ internal static partial class StatusPipeline
             }
         }
 
-        var applied = CommitChangesWithSha(config.LedgerRepository, proposal.Changes, store, runId).AppliedPaths;
-        return new RunResult { RunId = runId, ReportPath = "", AppliedCards = applied, StopReason = null, ExitCode = 0 };
+        var commitResult = CommitChangesWithSha(config.LedgerRepository, proposal.Changes, store, runId);
+        var receipt = commitResult.AppliedPaths.Count > 0 ? WriteApplicationReceipt(config, runId, commitResult.AppliedPaths, commitResult.CommitSha) : null;
+        return new RunResult { RunId = runId, ReportPath = "", AppliedCards = commitResult.AppliedPaths, ApplicationReceiptPath = receipt, StopReason = null, ExitCode = 0 };
     }
 
     private static IReadOnlyList<ThreadRecord> SyncFingerprints(RunRequest request, IReadOnlyList<ThreadRecord> stored)
@@ -617,7 +621,8 @@ internal static partial class StatusPipeline
             groups[match.Card.RelativePath] = group;
         }
 
-        foreach (var tracked in await RefreshOutsideWindowAsync(request, threads, eligible, cards, skipped, skipGate, cancellationToken))
+        var deferredRefreshIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var tracked in await RefreshOutsideWindowAsync(request, threads, eligible, cards, skipped, skipGate, cancellationToken, deferredRefreshIds))
         {
             var id = tracked.Thread.Source + ":" + tracked.Thread.NativeId;
             if (!threadDiags.ContainsKey(id))
@@ -656,7 +661,7 @@ internal static partial class StatusPipeline
                 continue;
             }
 
-            if (tracked.Thread.Assessment is null || string.IsNullOrWhiteSpace(tracked.Thread.MatchedWorkstream))
+            if (tracked.Thread.Assessment is null)
             {
                 continue;
             }
@@ -671,6 +676,7 @@ internal static partial class StatusPipeline
             failedPulls,
             skipped,
             skipGate,
+            deferredRefreshIds,
             cancellationToken);
         var changes = new List<LedgerChange>();
         var cardDiags = new List<CardDiagnostic>();
@@ -705,6 +711,7 @@ internal static partial class StatusPipeline
             var hash = ReconcileHash(group.Card.Text, views, request.Config);
             if (views.All(view => view.Thread.ReconcileFingerprint == hash))
             {
+                var referenceSuggestions = CrossCardReferenceSuggestions(group.Card, views, cards);
                 cardDiags.Add(new CardDiagnostic
                 {
                     RelativePath = group.Card.RelativePath,
@@ -714,7 +721,9 @@ internal static partial class StatusPipeline
                     ReasonCode = "reconcile_cached",
                     ReasonDetail = "カード本文・評価結果・PR状態のfingerprintが前回と一致したためcacheを再利用。",
                     ReconcilePrompt = reconcilePrompt,
+                    WorkstreamDiagnostics = referenceSuggestions,
                 });
+                PersistDeferredRefreshPulls(request.Store, views, snapshots, deferredRefreshIds);
                 foreach (var view in views)
                 {
                     if (threadDiags.TryGetValue(view.Thread.Source + ":" + view.Thread.NativeId, out var tDiag))
@@ -728,46 +737,19 @@ internal static partial class StatusPipeline
                 continue;
             }
 
-            if (group.Card.Workstreams.Count == 0)
-            {
-                cardDiags.Add(new CardDiagnostic
-                {
-                    RelativePath = group.Card.RelativePath,
-                    ReconcileCacheHit = false,
-                    ReconcileHash = hash,
-                    Stage = "reconciled",
-                    ReasonCode = "reconcile_no_workstream",
-                    ReasonDetail = "カードに進行中のworkstreamが存在しない。",
-                    ReconcilePrompt = reconcilePrompt,
-                });
-                foreach (var view in views)
-                {
-                    if (threadDiags.TryGetValue(view.Thread.Source + ":" + view.Thread.NativeId, out var tDiag))
-                    {
-                        tDiag.Stage = "reconciled";
-                        tDiag.ReasonCode = "reconcile_no_workstream";
-                        tDiag.ReasonDetail = "カードに進行中のworkstreamが存在しない。";
-                    }
-                }
-
-                continue;
-            }
-
             try
             {
                 var updates = await ModelOf(request).ReconcileAsync(ThreadPrompts.ReconcileSystem, reconcilePrompt, cancellationToken);
                 var change = LedgerPlanner.ApplyWithDiagnostics(group.Card, views, updates, out var wsDiags, out var unselectedIds);
+                var referenceSuggestions = CrossCardReferenceSuggestions(group.Card, views, cards);
                 if (change is not null)
                 {
                     changes.Add(change);
                 }
 
                 Remember(request.Store, group.Card, views, change, request.Config);
-                var cardReasonCode = change is not null
-                    ? "proposed"
-                    : (group.Card.Workstreams.Count == 0
-                        ? "reconcile_no_workstream"
-                        : (wsDiags.FirstOrDefault()?.ReasonCode ?? "reconcile_no_updates"));
+                PersistDeferredRefreshPulls(request.Store, views, snapshots, deferredRefreshIds);
+                var cardReasonCode = change is not null ? "proposed" : (wsDiags.FirstOrDefault()?.ReasonCode ?? "reconcile_no_updates");
                 var cardReasonDetail = change is not null
                     ? "台帳変更案を作成した。"
                     : (wsDiags.FirstOrDefault()?.ReasonDetail ?? "モデルから変更対象のworkstream更新が返されなかった。");
@@ -782,7 +764,7 @@ internal static partial class StatusPipeline
                     ReasonDetail = cardReasonDetail,
                     ReconcilePrompt = reconcilePrompt,
                     Updates = updates,
-                    WorkstreamDiagnostics = wsDiags,
+                    WorkstreamDiagnostics = wsDiags.Concat(referenceSuggestions).ToList(),
                     UnselectedReportIds = unselectedIds,
                 });
 
@@ -799,6 +781,7 @@ internal static partial class StatusPipeline
                     ReasonCode = "reconcile_failed",
                     ReasonDetail = ex.Message,
                     ReconcilePrompt = reconcilePrompt,
+                    WorkstreamDiagnostics = CrossCardReferenceSuggestions(group.Card, views, cards),
                 });
                 // 1枚の照合失敗で、他のカードの更新を止めない。
                 RecordSkip(skipped, skipGate, group.Card.RelativePath, ex.Message);
@@ -1224,7 +1207,8 @@ internal static partial class StatusPipeline
         IReadOnlyList<ProjectCard> cards,
         List<ProcessingSkip> skipped,
         object skipGate,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        HashSet<string> deferredRefreshIds)
     {
         var inside = eligible.Select(thread => thread.Source + ":" + thread.NativeId).ToHashSet(StringComparer.Ordinal);
         var extra = new List<(ProjectCard, ThreadRecord)>();
@@ -1241,8 +1225,13 @@ internal static partial class StatusPipeline
                 continue;
             }
 
-            request.Store.UpsertPull(fresh, tracked.ActivityId);
-            if (fresh.State != PullRequestState.Merged || string.IsNullOrWhiteSpace(tracked.ActivityId) || inside.Contains(tracked.ActivityId))
+            if (fresh.State != PullRequestState.Merged)
+            {
+                request.Store.UpsertPull(fresh, tracked.ActivityId);
+                continue;
+            }
+
+            if (string.IsNullOrWhiteSpace(tracked.ActivityId) || inside.Contains(tracked.ActivityId))
             {
                 continue;
             }
@@ -1254,10 +1243,7 @@ internal static partial class StatusPipeline
             }
 
             var thread = threads.FirstOrDefault(item => item.Source == parts[0] && item.NativeId == parts[1]);
-            if (thread?.Assessment is null ||
-                !string.IsNullOrWhiteSpace(thread.Assessment.ExplicitRemainingWork) ||
-                thread.Assessment.RemainingWorkUnverified ||
-                thread.HasTrailingUnansweredUserTurn)
+            if (thread?.Assessment is null)
             {
                 continue;
             }
@@ -1269,6 +1255,7 @@ internal static partial class StatusPipeline
                 continue;
             }
 
+            deferredRefreshIds.Add(tracked.ActivityId);
             extra.Add((card, thread));
         }
 
@@ -1281,6 +1268,7 @@ internal static partial class StatusPipeline
         HashSet<string> failedUrls,
         List<ProcessingSkip> skipped,
         object skipGate,
+        IReadOnlySet<string> deferredRefreshIds,
         CancellationToken cancellationToken)
     {
         var snapshots = new Dictionary<string, PullRequestSnapshot>(StringComparer.OrdinalIgnoreCase);
@@ -1295,7 +1283,7 @@ internal static partial class StatusPipeline
             {
                 var snapshot = await PullsOf(request).GetAsync(pair.Reference.Owner, pair.Reference.Repository, pair.Reference.Number, cancellationToken);
                 snapshots[snapshot.Url] = snapshot;
-                request.Store.UpsertPull(snapshot, pair.ActivityId);
+                if (!deferredRefreshIds.Contains(pair.ActivityId)) request.Store.UpsertPull(snapshot, pair.ActivityId);
             }
             catch (StatusCheckException ex) when (!ex.Fatal)
             {
@@ -1306,6 +1294,55 @@ internal static partial class StatusPipeline
         }
 
         return snapshots;
+    }
+
+    private static void PersistDeferredRefreshPulls(
+        StateStore store,
+        IReadOnlyList<ThreadView> views,
+        IReadOnlyDictionary<string, PullRequestSnapshot> snapshots,
+        IReadOnlySet<string> deferredRefreshIds)
+    {
+        foreach (var view in views)
+        {
+            var activityId = view.Thread.Source + ":" + view.Thread.NativeId;
+            if (!deferredRefreshIds.Contains(activityId)) continue;
+            foreach (var pull in view.Pulls)
+            {
+                if (snapshots.TryGetValue(pull.Url, out var snapshot)) store.UpsertPull(snapshot, activityId);
+            }
+        }
+    }
+
+    internal static IReadOnlyList<WorkstreamDiagnostic> CrossCardReferenceSuggestions(
+        ProjectCard matchedCard,
+        IReadOnlyList<ThreadView> reports,
+        IReadOnlyList<ProjectCard> cards)
+    {
+        var suggestions = new List<WorkstreamDiagnostic>();
+        foreach (var report in reports)
+        {
+            var text = string.Join("\n", new[] { report.Thread.Request?.Text, report.Thread.Response?.Text }
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .Concat(report.Thread.Turns.Select(turn => turn.Text))
+                .Concat(report.Thread.Signals.Select(signal => signal.Text)));
+            var explicitRefs = Normalize.GitHubRefs(text);
+            var activityId = report.Thread.Source + ":" + report.Thread.NativeId;
+            foreach (var other in cards.Where(card => card.RelativePath != matchedCard.RelativePath && card.Repositories.Count > 0))
+            {
+                // Only flag an explicit cross-repository URL already written in another card; no semantic matching or reassignment.
+                if (other.Repositories.Any(repository => matchedCard.Repositories.Contains(repository, StringComparer.OrdinalIgnoreCase))) continue;
+                foreach (var reference in explicitRefs.Where(reference => other.Text.Contains(reference.Url, StringComparison.OrdinalIgnoreCase) &&
+                             !other.Repositories.Contains(reference.Owner + "/" + reference.Repository, StringComparer.OrdinalIgnoreCase)))
+                {
+                    suggestions.Add(new WorkstreamDiagnostic(
+                        "__cross_card_reference__", "suggestion", "candidate", "cross_card_explicit_reference_candidate",
+                        "報告 " + activityId + " が明示した " + reference.Url + " は別repositoryのカード " + other.RelativePath + " にも明示参照されている。自動で再割当て・更新は行っていない。",
+                        [activityId], Applied: false));
+                }
+            }
+        }
+
+        return suggestions.DistinctBy(item => item.ReasonDetail, StringComparer.Ordinal).ToList();
     }
 
     private static void RecordSkip(List<ProcessingSkip> skipped, object gate, string subject, string message)
@@ -1670,6 +1707,12 @@ internal static partial class StatusPipeline
         }
 
         var ordered = scores.OrderByDescending(item => item.Score).ToList();
+        if (repoCards.Count == 1)
+        {
+            return new CardMatchResult(repoCards[0], null, "matched_by_repository",
+                "同一repositoryに一致するProjectカードが1枚だけのため照合した。", paths);
+        }
+
         if (ordered[0].Score >= 3 && ordered[0].Score >= ordered[1].Score + 2)
         {
             return new CardMatchResult(
@@ -1984,6 +2027,7 @@ internal static partial class StatusPipeline
         var path = Path.Combine(directory, "report.md");
         var text = ReportWriter.Write(new ReportModel
         {
+            Command = request.ApplyLedger ? "run" : "preview",
             Window = request.Window,
             QueriedAt = request.Now,
             InputMode = request.Config.InputMode,
@@ -2007,6 +2051,22 @@ internal static partial class StatusPipeline
         Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, "trace.json");
         File.WriteAllText(path, trace.ToJson(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        return path;
+    }
+
+    private static string WriteApplicationReceipt(AppConfig config, string runId, IReadOnlyList<string> appliedPaths, string? commitSha)
+    {
+        var directory = Path.Combine(config.ReportsDirectory, runId);
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "application.json");
+        var temporary = path + ".tmp";
+        static string Quote(string value) => "\"" + System.Text.Json.JsonEncodedText.Encode(value).ToString() + "\"";
+        var json = "{\n  \"runId\": " + Quote(runId)
+            + ",\n  \"appliedAtUtc\": " + Quote(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture))
+            + ",\n  \"commitSha\": " + (commitSha is null ? "null" : Quote(commitSha))
+            + ",\n  \"appliedPaths\": [" + string.Join(", ", appliedPaths.Select(Quote)) + "]\n}\n";
+        File.WriteAllText(temporary, json, new UTF8Encoding(false));
+        File.Move(temporary, path, overwrite: true);
         return path;
     }
 
@@ -2173,6 +2233,7 @@ internal sealed class RunResult
     public string? TracePath { get; init; }
     public RunTrace? Trace { get; init; }
     public required IReadOnlyList<string> AppliedCards { get; init; }
+    public string? ApplicationReceiptPath { get; init; }
     public string? StopReason { get; init; }
     public int ExitCode { get; init; }
     public IReadOnlyList<IngestSkip> SkippedLogs { get; init; } = [];

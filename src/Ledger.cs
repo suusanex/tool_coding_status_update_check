@@ -192,7 +192,7 @@ internal static partial class CardParser
         return text[(match.Index + match.Length)..end].Trim();
     }
 
-    private static bool ContainsSection(string text, string heading) =>
+    internal static bool ContainsSection(string text, string heading) =>
         Regex.IsMatch(text, "(?m)^## " + Regex.Escape(heading) + @"\s*$");
 
     private static IReadOnlyList<WorkstreamSlice> Workstreams(string text)
@@ -337,7 +337,7 @@ internal static class LedgerPlanner
     {
         var diagList = new List<WorkstreamDiagnostic>();
         var selectedIds = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var update in updates)
+        foreach (var update in updates.OrderBy(update => update.Workstream == LedgerTargets.ProjectCurrent ? 1 : 0))
         {
             if (update.ReportIds is not null)
             {
@@ -360,7 +360,7 @@ internal static class LedgerPlanner
         var pullStates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         string? current = null;
         var touched = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var update in updates)
+        foreach (var update in updates.OrderBy(update => update.Workstream == LedgerTargets.ProjectCurrent ? 1 : 0))
         {
             if (string.IsNullOrWhiteSpace(update.Workstream))
             {
@@ -369,6 +369,12 @@ internal static class LedgerPlanner
 
             if (update.Action.Equals("none", StringComparison.OrdinalIgnoreCase))
             {
+                if (update.Workstream == LedgerTargets.ProjectCurrent)
+                {
+                    diagList.Add(new WorkstreamDiagnostic(LedgerTargets.ProjectCurrent, "none", "guard_checked",
+                        "reconcile_project_current_invalid", "予約対象はaction=updateのみ許可される。", update.ReportIds ?? [], Applied: false));
+                    continue;
+                }
                 diagList.Add(new WorkstreamDiagnostic(
                     update.Workstream,
                     "none",
@@ -377,6 +383,75 @@ internal static class LedgerPlanner
                     string.IsNullOrWhiteSpace(update.Reason) ? "モデルが変更不要（action=none）と判断した。" : update.Reason,
                     update.ReportIds ?? [],
                     Applied: false));
+                continue;
+            }
+
+            if (update.Workstream == LedgerTargets.ProjectCurrent)
+            {
+                var projectReports = ReportsFor(reports, update);
+                var knownIds = reports.Select(report => report.Thread.Source + ":" + report.Thread.NativeId).ToHashSet(StringComparer.Ordinal);
+                var ids = update.ReportIds ?? [];
+                if (!update.Action.Equals("update", StringComparison.OrdinalIgnoreCase) ||
+                    ids.Count == 0 || ids.Any(id => !knownIds.Contains(id)) || projectReports.Count == 0 || !CardParser.ContainsSection(card.Text, "現在地") ||
+                    string.IsNullOrWhiteSpace(update.Current))
+                {
+                    diagList.Add(new WorkstreamDiagnostic(LedgerTargets.ProjectCurrent, update.Action, "guard_checked",
+                        "reconcile_project_current_invalid", "Project現在地の更新は既知の報告IDと空でない完成後の現在地が必要。", ids, Applied: false));
+                    continue;
+                }
+
+                var proposed = update.Current.Trim();
+                var currentBeforeProjectUpdate = current ?? card.Current;
+                var rendered = !string.IsNullOrEmpty(currentBeforeProjectUpdate) && currentBeforeProjectUpdate.Contains(proposed, StringComparison.Ordinal) && proposed.Length < currentBeforeProjectUpdate.Length
+                    ? currentBeforeProjectUpdate
+                    : proposed;
+                // A card-level summary must not erase facts that still belong to other active workstreams.
+                var retainedFacts = card.Workstreams.Where(workstream => !touched.Contains(workstream.Heading))
+                    .SelectMany(workstream => Normalize.SplitSentences(workstream.Current))
+                    .Select(sentence => sentence.Trim())
+                    .Where(sentence => sentence.Length >= 8 && card.Current.Contains(sentence, StringComparison.Ordinal))
+                    .Distinct(StringComparer.Ordinal);
+                var factsOwnedByUpdatedWorkstreams = card.Workstreams.Where(workstream => touched.Contains(workstream.Heading))
+                    .SelectMany(workstream => Normalize.SplitSentences(workstream.Current))
+                    .Select(sentence => sentence.Trim()).ToHashSet(StringComparer.Ordinal);
+                foreach (var oldFact in Normalize.SplitSentences(card.Current).Select(sentence => sentence.Trim()).Where(sentence => sentence.Length >= 8))
+                {
+                    if (factsOwnedByUpdatedWorkstreams.Contains(oldFact) || IsSupersededSummaryFact(oldFact, proposed)) continue;
+                    if (!rendered.Contains(oldFact, StringComparison.Ordinal)) rendered = rendered.TrimEnd() + " " + oldFact;
+                }
+                foreach (var fact in retainedFacts)
+                {
+                    if (!rendered.Contains(fact, StringComparison.Ordinal)) rendered = rendered.TrimEnd() + " " + fact;
+                }
+                if (!string.IsNullOrWhiteSpace(currentBeforeProjectUpdate) && currentBeforeProjectUpdate.Contains(LedgerPlanner.CompletionFact, StringComparison.Ordinal) &&
+                    !rendered.Contains(LedgerPlanner.CompletionFact, StringComparison.Ordinal))
+                {
+                    rendered = rendered.TrimEnd() + " " + LedgerPlanner.CompletionFact;
+                }
+                var latestProjectReport = Latest(projectReports);
+                var remaining = latestProjectReport?.Assessment?.ExplicitRemainingWork;
+                if (latestProjectReport?.Assessment?.RemainingWorkUnverified != true &&
+                    !string.IsNullOrWhiteSpace(remaining) && !rendered.Contains(remaining, StringComparison.Ordinal))
+                {
+                    rendered = rendered.TrimEnd() + " 残作業: " + remaining.Trim();
+                }
+                if (rendered != currentBeforeProjectUpdate)
+                {
+                    current = rendered;
+                    var projectActivityId = LatestActivity(projectReports);
+                    decisions.Add(new LedgerDecision
+                    {
+                        Key = Normalize.ShortHash(projectActivityId + "\n" + card.RelativePath + "\n" + LedgerTargets.ProjectCurrent + "\nupdate"),
+                        ActivityId = projectActivityId,
+                        Workstream = LedgerTargets.ProjectCurrent,
+                        Action = "update",
+                        RelativePath = card.RelativePath,
+                    });
+                    foreach (var report in projectReports.SelectMany(report => report.Pulls)) pullStates[report.Url] = report.State.ToString();
+                }
+                diagList.Add(new WorkstreamDiagnostic(LedgerTargets.ProjectCurrent, "update", rendered == currentBeforeProjectUpdate ? "reconciled" : "proposed",
+                    rendered == currentBeforeProjectUpdate ? "reconcile_noop_richer_existing" : "update_proposed",
+                    "Projectカードの現在地へ、照合した報告の進捗要約を反映する。", ids, Applied: false));
                 continue;
             }
 
@@ -395,6 +470,12 @@ internal static class LedgerPlanner
             }
 
             var action = update.Action.ToLowerInvariant();
+            if (action is not ("update" or "delete"))
+            {
+                diagList.Add(new WorkstreamDiagnostic(slice.Heading, update.Action, "guard_checked", "reconcile_invalid_action",
+                    "actionはupdate/none/deleteのいずれかでなければならない。", update.ReportIds ?? [], Applied: false));
+                continue;
+            }
             var relevant = ReportsFor(reports, update);
             if (action == "delete")
             {
@@ -522,7 +603,7 @@ internal static class LedgerPlanner
 
         if (decisions.Any(decision => decision.Action == "delete"))
         {
-            var others = card.Workstreams.Where(workstream => decisions.All(decision => decision.Action != "delete" || decision.Workstream != workstream.Heading)).ToList();
+            var others = card.Workstreams.Where(workstream => !touched.Contains(workstream.Heading)).ToList();
             foreach (var other in others)
             {
                 foreach (var sentence in Normalize.SplitSentences(other.Current))
@@ -631,6 +712,42 @@ internal static class LedgerPlanner
     /// </summary>
     private static bool FieldKept(string? proposed, string rendered, string existing) =>
         proposed is null || (rendered.Length > 0 && existing.Contains(rendered, StringComparison.Ordinal));
+
+    private static bool IsSupersededSummaryFact(string oldFact, string proposed)
+    {
+        // A state transition alone does not prove that two sentences describe the same subject.
+        // Preserve explicitly scoped old facts unless the proposed sentence repeats that scope.
+        var oldScope = Regex.Match(oldFact, @"^(.{1,30}?)(?:は|が|の|:|：)").Groups[1].Value.Trim();
+        foreach (var proposedFact in Normalize.SplitSentences(proposed).Select(sentence => sentence.Trim()))
+        {
+            var proposedScope = Regex.Match(proposedFact, @"^(.{1,30}?)(?:は|が|の|:|：)").Groups[1].Value.Trim();
+            if (oldScope.Length > 0 && !string.Equals(oldScope, proposedScope, StringComparison.Ordinal)) continue;
+            if (oldScope.Length == 0 && proposedScope.Length > 0) continue;
+            if (IsOpposingSummaryState(oldFact, proposedFact)) return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsOpposingSummaryState(string oldFact, string proposed)
+    {
+        var opposingStates = new (string[] Negative, string[] Positive)[]
+        {
+            (["未実装", "実装していない", "実装なし", "未着手"], ["実装済み", "実装した", "実装完了", "実装を完了", "実装を開始", "実装開始"]),
+            (["PR未作成", "PRはまだ作成していない", "PR作成前", "PR作成待ち"], ["PR作成済み", "PRを作成", "PR作成した", "PR作成完了"]),
+            (["未統合", "未マージ", "マージ待ち"], ["マージ済み", "マージされた", "Merged"]),
+            (["未デプロイ", "デプロイ前", "デプロイ待ち"], ["デプロイ済み", "デプロイした", "本番反映済み"]),
+            (["未受入", "受入待ち", "承認待ち"], ["受入済み", "承認済み", "承認された"]),
+            (["CI失敗", "テスト失敗", "テスト未実施"], ["CI成功", "テスト成功", "テスト通過"]),
+        };
+        foreach (var (negative, positive) in opposingStates)
+        {
+            if (negative.Any(marker => oldFact.Contains(marker, StringComparison.Ordinal)) && positive.Any(marker => proposed.Contains(marker, StringComparison.Ordinal)) ||
+                positive.Any(marker => oldFact.Contains(marker, StringComparison.Ordinal)) && negative.Any(marker => proposed.Contains(marker, StringComparison.Ordinal))) return true;
+        }
+
+        return false;
+    }
 
     private static string AppendUrls(string existing, IEnumerable<string> urls, string newline)
     {
