@@ -266,6 +266,12 @@ internal sealed record LedgerFieldUpdate(
     string Reason,
     IReadOnlyList<string>? ReportIds = null);
 
+/// <summary>Reserved reconcile target for the Project card's top-level 現在地 section.</summary>
+internal static class LedgerTargets
+{
+    internal const string ProjectCurrent = "__project_current__";
+}
+
 internal interface IActivityModel
 {
     Task<ThreadAssessment> AssessAsync(string system, string user, CancellationToken cancellationToken);

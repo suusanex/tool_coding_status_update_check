@@ -51,6 +51,8 @@ internal static class Cli
                 };
             }
 
+            PrintContext(command, config, options.ConfigPath, options.ProposalRunId);
+
             if (command == "apply")
             {
                 if (string.IsNullOrWhiteSpace(options.ProposalRunId))
@@ -60,7 +62,7 @@ internal static class Cli
 
                 using var applyStore = new StateStore(config.DatabasePath);
                 var applied = await StatusPipeline.ApplyAsync(config, applyStore, options.ProposalRunId, new GhPullRequestSource(), CancellationToken.None);
-                Print(applied);
+                Print(applied, command, options.ConfigPath);
                 return applied.ExitCode;
             }
 
@@ -95,7 +97,7 @@ internal static class Cli
                 Now = DateTimeOffset.UtcNow,
                 RunId = runId,
             }, CancellationToken.None);
-            Print(result);
+            Print(result, command, options.ConfigPath);
             return result.ExitCode;
         }
         catch (StatusCheckException ex)
@@ -105,8 +107,9 @@ internal static class Cli
         }
     }
 
-    private static void Print(RunResult result)
+    private static void Print(RunResult result, string command, string? configPath)
     {
+        Console.WriteLine("runId: " + result.RunId);
         foreach (var skip in result.SkippedLogs)
         {
             Console.Error.WriteLine(skip.ToLog());
@@ -142,9 +145,54 @@ internal static class Cli
 
         if (!result.Estimated)
         {
-            Console.WriteLine(result.AppliedCards.Count == 0 ? "applied: none" : "applied: " + string.Join(", ", result.AppliedCards));
+            if (command == "preview")
+            {
+                Console.WriteLine("ledger: preview only; not applied");
+                Console.WriteLine("to apply: " + BuildApplyCommand(result.RunId, configPath));
+            }
+            else if (result.AppliedCards.Count == 0)
+            {
+                Console.WriteLine(command == "apply" ? "ledger: apply checked; no cards changed" : "ledger: run completed; no cards changed");
+            }
+            else
+            {
+                Console.WriteLine("applied: " + string.Join(", ", result.AppliedCards));
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.ApplicationReceiptPath))
+        {
+            Console.WriteLine("application receipt: " + result.ApplicationReceiptPath);
         }
     }
+
+    private static void PrintContext(string command, AppConfig config, string? configPath, string? proposalRunId)
+    {
+        Console.WriteLine("command: " + command);
+        if (command == "apply")
+        {
+            Console.WriteLine("proposal runId: " + (proposalRunId ?? "<missing>"));
+        }
+
+        Console.WriteLine("artifact: " + RuntimeIdentity.Describe());
+        Console.WriteLine("working directory: " + Environment.CurrentDirectory);
+        Console.WriteLine("input mode: " + InputModes.NormalizeMode(config.InputMode));
+        Console.WriteLine("ledger checkout: " + Path.GetFullPath(config.LedgerRepository));
+        Console.WriteLine("config: " + Path.GetFullPath(string.IsNullOrWhiteSpace(configPath) ? AppConfig.DefaultConfigPath : configPath));
+    }
+
+    private static string BuildApplyCommand(string runId, string? configPath)
+    {
+        var command = "dotnet run --file src/StatusCheck.cs -- apply --proposal " + runId;
+        if (!string.IsNullOrWhiteSpace(configPath))
+        {
+            command += " --config " + QuotePowerShellLiteral(Path.GetFullPath(configPath));
+        }
+
+        return command;
+    }
+
+    private static string QuotePowerShellLiteral(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
 
     private static TimeWindow BuildWindow(CliOptions options)
     {

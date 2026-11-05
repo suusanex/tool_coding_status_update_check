@@ -16,7 +16,7 @@ internal static partial class Normalize
     internal const int MaxIntermediateTurns = 10;
     internal const int StoredBodyLimit = 200_000;
     internal const int InputModelVersion = 3;
-    internal const string PromptVersion = "v2";
+    internal const string PromptVersion = "v3";
 
     internal static string Sha256Hex(string text)
     {

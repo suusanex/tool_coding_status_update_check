@@ -43,6 +43,8 @@ await Case("estimate counts the selected payload and does not call the model", E
 await Case("an open pull on another report blocks deletion", OpenPullBlocksDelete);
 await Case("saved matching does not delete a coordinator update", CoordinatorUpdateSurvivesMerge);
 await Case("another workstream report does not mix into completion", OtherWorkstreamStaysOut);
+await Case("project summary updates without a workstream and validates cited reports", ProjectCurrentUpdate);
+await Case("pipeline reconciles and applies a no-workstream project summary", PipelineProjectCurrent);
 await Case("an empty field clears and null keeps the ledger", EmptyClearsNullKeeps);
 await Case("a replaced rollout does not keep the old thread", ReplacedRolloutDropsOldThread);
 await Case("an outside merge stays with an active card", OutsideMergeJoinsActiveCard);
@@ -274,6 +276,19 @@ async Task RefreshMerge()
     Check(world.Commits() == 2, "open pull did not update the card");
     Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "open pull deleted the workstream");
     world.Pulls.Set("acme", "widgets", 7, PullRequestState.Merged, new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero));
+    var failRefreshOnce = true;
+    world.Model.ReconcileOverride = (_, _) =>
+    {
+        if (failRefreshOnce)
+        {
+            failRefreshOnce = false;
+            throw new StatusCheckException("scripted outside refresh failure");
+        }
+
+        return [new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:sess"])];
+    };
+    await world.Run(true, window: World.Day(2));
+    Check(world.CardText().Contains("### ウィジェット修正", StringComparison.Ordinal), "failed refresh deleted the workstream");
     var result = await world.Run(true, window: World.Day(2));
     var text = world.CardText();
     Check(!text.Contains("### ウィジェット修正", StringComparison.Ordinal), "merged pull kept the workstream");
@@ -391,6 +406,7 @@ async Task ApplyProposal()
     var applied = await world.Apply(preview.RunId);
     Check(applied.ExitCode == 0, applied.StopReason ?? "apply failed");
     Check(world.Commits() == 2, "apply did not commit");
+    Check(applied.ApplicationReceiptPath is not null && File.Exists(applied.ApplicationReceiptPath), "apply command did not write the success receipt");
 
     await using var changed = World.Create();
     changed.WriteCard(OneCard("なし。"));
@@ -749,6 +765,109 @@ Task OtherWorkstreamStaysOut()
     Check(!deleted!.NewText.Contains("残作業は説明書の更新", StringComparison.Ordinal), "another workstream remaining work was mixed in");
     Check(deleted.NewText.Contains("### 文書整理", StringComparison.Ordinal), "the other workstream was removed");
     return Task.CompletedTask;
+}
+
+Task ProjectCurrentUpdate()
+{
+    var baseCardText = TwoCard(null).Replace("別件の文書整理は未着手である。", "別件の文書整理は未着手である。プロジェクト全体の基盤は安定している。", StringComparison.Ordinal);
+    var baseCard = CardParser.Parse("projects/widgets.md", baseCardText);
+    var noWorkstreamsText = System.Text.RegularExpressions.Regex.Replace(baseCard.Text,
+        "(?s)(## 進行中のworkstream\\s*\\n).*", "$1なし。\\n");
+    var noWorkstreamCard = CardParser.Parse("projects/widgets.md", noWorkstreamsText);
+    var report = ReportView("summary", "実装済み。PR #7 はレビュー待ち。", "2026-11-01T00:20:00Z", Snapshot(7, PullRequestState.Open));
+    var update = new LedgerFieldUpdate(LedgerTargets.ProjectCurrent, "update", "実装済み。PR #7 はレビュー待ち。", null, null, "", ["codex:summary"]);
+    var changed = LedgerPlanner.Apply(noWorkstreamCard, [report], [update]);
+    Check(changed is not null && changed.NewText.Contains("実装済み。PR #7 はレビュー待ち。", StringComparison.Ordinal), "project summary was not updated without workstreams");
+    Check(CardParser.Parse("projects/widgets.md", changed!.NewText).Workstreams.Count == 0, "project update fabricated a workstream");
+    var staleCard = CardParser.Parse("projects/widgets.md", System.Text.RegularExpressions.Regex.Replace(noWorkstreamsText,
+        "(?s)(## 現在地\\s*\\n).*?(?=\\n## )", "$1未実装。\\n"));
+    var correctedSummary = LedgerPlanner.Apply(staleCard, [report], [update with { Current = "実装済み。PR #7 はレビュー待ち。" }]);
+    Check(correctedSummary is not null && !CardParser.Parse("projects/widgets.md", correctedSummary!.NewText).Current.Contains("未実装", StringComparison.Ordinal), "contradicted stale project fact was retained");
+
+    var scopedStaleCard = CardParser.Parse("projects/widgets.md", System.Text.RegularExpressions.Regex.Replace(noWorkstreamsText,
+        "(?s)(## 現在地\\s*\\n).*?(?=\\n## )", "$1別件の機能は未実装。\\n"));
+    Check(scopedStaleCard.Current.Contains("別件の機能は未実装。", StringComparison.Ordinal), "scoped-negative fixture was not constructed: " + scopedStaleCard.Current);
+    var scopedCorrection = LedgerPlanner.Apply(scopedStaleCard, [report], [update]);
+    Check(scopedCorrection is not null && CardParser.Parse("projects/widgets.md", scopedCorrection!.NewText).Current.Contains("別件の機能は未実装。", StringComparison.Ordinal), "unrelated scoped negative fact was removed by an unrelated positive marker: " + CardParser.Parse("projects/widgets.md", scopedCorrection!.NewText).Current);
+
+    var mixedUpdate = new LedgerFieldUpdate("ウィジェット修正", "update", "実装を進めた。", null, null, "", ["codex:summary"]);
+    var mixed = LedgerPlanner.Apply(baseCard, [report], [update, mixedUpdate]);
+    Check(mixed is not null && mixed.NewText.Contains("別件の文書整理は未着手である。", StringComparison.Ordinal), "project summary update dropped an untouched workstream fact");
+    Check(CardParser.Parse("projects/widgets.md", mixed!.NewText).Current.Contains("プロジェクト全体の基盤は安定している。", StringComparison.Ordinal), "project summary update thinned an unrelated existing fact");
+    Check(!CardParser.Parse("projects/widgets.md", mixed!.NewText).Current.Contains("ウィジェットの実装を続けている。", StringComparison.Ordinal), "project summary retained stale fact from updated workstream");
+
+    var mergedReport = new ThreadView
+    {
+        Thread = report.Thread,
+        Pulls = [Snapshot(7, PullRequestState.Merged)],
+        Assessment = new ThreadAssessment { Summary = "実装完了", Purpose = "", CurrentPosition = "実装完了", ExplicitRemainingWork = "", NextAction = "", Uncertainty = "", SelectedPullUrls = [] },
+    };
+    foreach (var orderedUpdates in new[]
+             {
+                 new[] { update, new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:summary"]) },
+                 new[] { new LedgerFieldUpdate("ウィジェット修正", "delete", null, null, null, "", ["codex:summary"]), update },
+             })
+    {
+        var completionAndSummary = LedgerPlanner.Apply(baseCard, [mergedReport], orderedUpdates);
+        Check(completionAndSummary is not null && !completionAndSummary.NewText.Contains("### ウィジェット修正", StringComparison.Ordinal), "mixed project update/delete did not complete the workstream");
+        Check(CardParser.Parse("projects/widgets.md", completionAndSummary!.NewText).Current.Contains(LedgerPlanner.CompletionFact, StringComparison.Ordinal), "project summary update lost merged completion fact");
+    }
+
+    var invalid = LedgerPlanner.Apply(noWorkstreamCard, [report], [update with { ReportIds = ["codex:unknown"] }]);
+    Check(invalid is null, "unknown-only report IDs were accepted for project summary");
+    var invalidAction = LedgerPlanner.Apply(noWorkstreamCard, [report], [update with { Action = "delete" }]);
+    Check(invalidAction is null, "project summary target accepted delete");
+    var remainingReport = new ThreadView
+    {
+        Thread = report.Thread,
+        Pulls = [Snapshot(7, PullRequestState.Merged)],
+        Assessment = new ThreadAssessment { Summary = "実装完了", Purpose = "", CurrentPosition = "実装完了", ExplicitRemainingWork = "人間の承認を待つ。", NextAction = "", Uncertainty = "", SelectedPullUrls = [] },
+    };
+    var keptRemaining = LedgerPlanner.Apply(noWorkstreamCard, [remainingReport], [update]);
+    Check(keptRemaining is not null && keptRemaining.NewText.Contains("残作業: 人間の承認を待つ。", StringComparison.Ordinal), "project summary update discarded an unresolved wait after merge");
+    var unverifiedRemainingReport = new ThreadView
+    {
+        Thread = remainingReport.Thread,
+        Pulls = remainingReport.Pulls,
+        Assessment = new ThreadAssessment
+        {
+            Summary = "実装完了", Purpose = "", CurrentPosition = "実装完了",
+            ExplicitRemainingWork = "人間の承認を待つ。", NextAction = "", Uncertainty = "",
+            SelectedPullUrls = [], RemainingWorkUnverified = true,
+        },
+    };
+    var unverifiedRemaining = LedgerPlanner.Apply(noWorkstreamCard, [unverifiedRemainingReport], [update]);
+    Check(unverifiedRemaining is not null && !unverifiedRemaining.NewText.Contains("残作業: 人間の承認を待つ。", StringComparison.Ordinal), "project summary wrote an unverified remaining-work quote");
+    var crossReport = ReportView("cross", "関連Issueを確認する https://github.com/acme/widgets/issues/42", "2026-11-01T00:20:00Z", Snapshot(7, PullRequestState.Open));
+    var otherCard = CardParser.Parse("projects/other.md", "---\nstatus: active\nrepositories:\n  - acme/other\n---\n\n# Other\n\n## 目的\n\nOther.\n\n## 現在地\n\nIssue https://github.com/acme/widgets/issues/42 を参照。\n\n## 進行中のworkstream\n\nなし。\n");
+    var suggestions = StatusPipeline.CrossCardReferenceSuggestions(baseCard, [crossReport], [baseCard, otherCard]);
+    Check(suggestions.Count == 1 && suggestions[0].ReasonCode == "cross_card_explicit_reference_candidate", "explicit cross-repository reference candidate was not diagnosed");
+    Check(ThreadPrompts.ReconcileSystem.Contains("__project_current__", StringComparison.Ordinal), "reconcile prompt omitted the project-current target");
+    return Task.CompletedTask;
+}
+
+async Task PipelineProjectCurrent()
+{
+    await using var world = World.Create();
+    var noWorkstreams = System.Text.RegularExpressions.Regex.Replace(TwoCard(null),
+        "(?s)(## 進行中のworkstream\\s*\\n).*", "$1なし。\\n");
+    world.WriteCard(noWorkstreams);
+    world.WriteRollout("project-summary", "https://github.com/acme/widgets",
+        LogText.User("実装状況を確認して。"),
+        LogText.Assistant("実装は完了した。PRはまだ作成していない。", "final_answer"));
+    world.Model.ReconcileOverride = (_, user) =>
+    {
+        var id = user.Split('\n').FirstOrDefault(line => line.StartsWith("id: ", StringComparison.Ordinal))?[4..].Trim() ?? "";
+        return [new LedgerFieldUpdate(LedgerTargets.ProjectCurrent, "update", "実装は完了した。PRはまだ作成していない。", null, null, "fact progress", [id])];
+    };
+    var result = await world.Run(true);
+    Check(result.ExitCode == 0, result.StopReason ?? "pipeline project-current update failed");
+    var updated = CardParser.Parse("projects/widgets.md", world.CardText());
+    Check(updated.Current.Contains("実装は完了した。PRはまだ作成していない。", StringComparison.Ordinal), "pipeline did not apply card summary; cards=" + string.Join(";", result.Trace?.Cards.Select(card => card.ReasonCode + ":" + card.ReasonDetail + ":" + string.Join(",", card.Updates.SelectMany(update => update.ReportIds ?? []))) ?? []) + ";threads=" + string.Join(";", result.Trace?.Threads.Select(thread => thread.ActivityId + ":" + thread.MatchReasonCode + ":" + thread.MatchReasonDetail) ?? []));
+    Check(updated.Workstreams.Count == 0, "pipeline created a workstream");
+    Check(result.ApplicationReceiptPath is not null && File.Exists(result.ApplicationReceiptPath), "successful apply did not write application receipt");
+    var receipt = JsonNode.Parse(File.ReadAllText(result.ApplicationReceiptPath!))!.AsObject();
+    Check(receipt["runId"]?.GetValue<string>() == result.RunId && receipt["appliedPaths"] is JsonArray, "application receipt lacks run ID or applied paths");
 }
 
 Task EmptyClearsNullKeeps()

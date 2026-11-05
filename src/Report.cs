@@ -11,6 +11,18 @@ internal static class ReportWriter
         var builder = new StringBuilder();
         builder.AppendLine("# 活動状況");
         builder.AppendLine();
+        builder.AppendLine("## 実行の識別");
+        builder.AppendLine();
+        builder.AppendLine("- 実行種別: " + ExecutionLabel(model.Command, model.LedgerSummary));
+        builder.AppendLine("- proposal runId: " + (model.Trace?.RunId ?? "不明"));
+        builder.AppendLine("- コンパイル済みアーティファクト: " + RuntimeIdentity.Describe());
+        builder.AppendLine("- 実行時カレントディレクトリ: " + Environment.CurrentDirectory);
+        if (ExecutionLabel(model.Command, model.LedgerSummary) == "preview (未適用)")
+        {
+            builder.AppendLine("- 注意: この preview は台帳へ適用されていない。適用するには、この実行で使ったものと同じ設定（`--config` を指定した場合は同じパス）で `apply --proposal " + (model.Trace?.RunId ?? "<runId>") + "` を実行する。");
+        }
+
+        builder.AppendLine();
         builder.AppendLine("- 期間: " + model.Window.FromDate.ToString("yyyy-MM-dd") + " から " + model.Window.ToDate.ToString("yyyy-MM-dd") + " （タイムゾーン: " + model.Window.TimeZoneId + "）");
         builder.AppendLine("- 照会時刻: " + StateStore.FormatTime(model.QueriedAt));
         builder.AppendLine("- 収集対象: Codex rollout。CodexAgentFacade の events.jsonl は読まない。");
@@ -68,6 +80,9 @@ internal static class ReportWriter
         var builder = new StringBuilder();
         builder.AppendLine("# 送信量の推定");
         builder.AppendLine();
+        builder.AppendLine("- 実行種別: estimate (API・台帳更新なし)");
+        builder.AppendLine("- コンパイル済みアーティファクト: " + RuntimeIdentity.Describe());
+        builder.AppendLine("- 実行時カレントディレクトリ: " + Environment.CurrentDirectory);
         builder.AppendLine("APIは呼び出していない。これは llm_usage の実績ではない。出力トークンは推定していない。途中ログは送信対象に含めていない。");
         builder.AppendLine();
         builder.AppendLine("- 期間: " + window.FromDate.ToString("yyyy-MM-dd") + " から " + window.ToDate.ToString("yyyy-MM-dd") + " （タイムゾーン: " + window.TimeZoneId + "）");
@@ -243,6 +258,37 @@ internal static class ReportWriter
 
     private static string Format(DateTimeOffset? timestamp) =>
         timestamp is null ? "不明" : StateStore.FormatTime(timestamp.Value);
+
+    private static string ExecutionLabel(string? command, string ledgerSummary)
+    {
+        if (string.Equals(command, "preview", StringComparison.OrdinalIgnoreCase) || ledgerSummary.Contains("preview", StringComparison.OrdinalIgnoreCase))
+        {
+            return "preview (未適用)";
+        }
+
+        return string.IsNullOrWhiteSpace(command) ? "run" : command;
+    }
+}
+
+/// <summary>Best-effort identity of the loaded compiled artifact; it never claims to identify current source revision.</summary>
+internal static class RuntimeIdentity
+{
+    internal static string Describe()
+    {
+        string mvid;
+        try
+        {
+            mvid = typeof(RuntimeIdentity).Module.ModuleVersionId.ToString("D");
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException or BadImageFormatException)
+        {
+            mvid = "unavailable (" + ex.GetType().Name + ")";
+        }
+
+        return "compiled MVID=" + mvid
+            + "; process executable=" + (Environment.ProcessPath ?? "<unavailable>")
+            + "; runtime=" + Environment.Version.ToString();
+    }
 }
 
 internal sealed class ReportModel
@@ -250,6 +296,7 @@ internal sealed class ReportModel
     public required TimeWindow Window { get; init; }
     public required DateTimeOffset QueriedAt { get; init; }
     public string InputMode { get; init; } = InputModes.Default;
+    public string? Command { get; init; }
     public required IReadOnlyList<ThreadView> Threads { get; init; }
     public required IReadOnlyList<HoldNote> Holds { get; init; }
     public required string LedgerSummary { get; init; }
